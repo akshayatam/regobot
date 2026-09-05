@@ -13,9 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from regodit.analyst import AnalystEngine, InvestigationResult, ProfileEvidence, SecurityClaim, determine_intent
+from regodit.analyst import (
+    AnalystEngine, InvestigationResult, ProfileEvidence, SecurityClaim, claim_signature, determine_intent,
+)
 from regodit.analyst.claims import WEIGHTS
-from regodit.config import PROFILE_DB
+from regodit.config import PROFILE_DB, active_model
 from regodit.models import Evidence, QuestionnaireItem
 from regodit.retrieval import retrieve_evidence
 
@@ -56,6 +58,47 @@ class QuestionnaireState:
     evidence_ids: tuple[str, ...]
     missing_information: tuple[str, ...]
     updated_at: str
+
+
+@dataclass(frozen=True)
+class QuestionEvaluation:
+    """One recorded evaluation of a questionnaire item, kept for comparison and audit."""
+
+    id: int
+    question_id: str
+    model: str
+    run_type: str
+    run_id: str
+    answer: str | None
+    status: str
+    confidence: float
+    evidence_ids: tuple[str, ...]
+    conflicts: tuple[str, ...]
+    previous_status: str | None
+    accepted: bool
+    note: str | None
+    created_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        record = asdict(self)
+        record["evidence_ids"] = list(self.evidence_ids)
+        record["conflicts"] = list(self.conflicts)
+        return record
+
+
+@dataclass(frozen=True)
+class ObsoleteClaim:
+    """A claim assertion a user clarification has retired, with the evidence known at the time."""
+
+    signature: str
+    control: str
+    subject: str
+    attribute: str
+    scope: str
+    value: bool | str
+    evidence_ids: tuple[str, ...]
+    reason: str
+    resolved_at: str
 
 
 class SecurityProfile:
@@ -126,6 +169,50 @@ class SecurityProfile:
                     evidence_ids_json TEXT NOT NULL,
                     missing_information_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS question_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    question_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    run_type TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    answer TEXT,
+                    status TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    evidence_ids_json TEXT NOT NULL,
+                    conflicts_json TEXT NOT NULL,
+                    previous_status TEXT,
+                    accepted INTEGER NOT NULL,
+                    note TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_evaluation_question
+                    ON question_evaluations(question_id, created_at);
+                CREATE TABLE IF NOT EXISTS obsolete_claims (
+                    signature TEXT PRIMARY KEY,
+                    control_name TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    attribute_name TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    evidence_ids_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    resolved_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_obsolete_lookup
+                    ON obsolete_claims(control_name, subject);
+                CREATE TABLE IF NOT EXISTS conflict_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    question_id TEXT NOT NULL,
+                    control_name TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    existing_status TEXT NOT NULL,
+                    existing_answer TEXT,
+                    proposed_status TEXT NOT NULL,
+                    proposed_answer TEXT,
+                    evidence_ids_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS conflict_resolutions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -317,9 +404,22 @@ class SecurityProfile:
                 "INSERT INTO conflict_resolutions (winning_claim_id, superseded_claim_ids_json, stakeholder, raw_response, resolved_at) VALUES (?, ?, ?, ?, ?)",
                 (winning_claim_id, json.dumps(losing), stakeholder, raw_response, timestamp),
             )
+        # Superseding stored claims is not enough: the same assertion is re-derived from the
+        # source documents on every investigation, so retire the assertion as well.
+        retired = [entry.claim for entry in self.claim_history() if entry.claim.id in set(losing)]
+        if retired:
+            self.mark_claims_obsolete(retired, raw_response or f"Superseded by {winning_claim_id}")
         LOGGER.info("Resolved conflict in favor of %s; superseded %s", winning_claim_id, losing)
 
-    def save_questionnaire_result(self, result: InvestigationResult) -> None:
+    def save_questionnaire_result(
+        self,
+        result: InvestigationResult,
+        model: str | None = None,
+        run_type: str = "investigation",
+        run_id: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        previous = self.questionnaire_state(result.question_id)
         with self._connect() as db:
             db.execute(
                 """INSERT INTO questionnaire_state VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -329,6 +429,170 @@ class SecurityProfile:
                 (result.question_id, result.answer, result.status, result.confidence, json.dumps(result.evidence_ids),
                  json.dumps(result.missing_information), _now()),
             )
+        self.record_evaluation(
+            question_id=result.question_id, model=model or active_model(), run_type=run_type,
+            run_id=run_id or run_type, answer=result.answer, status=result.status, confidence=result.confidence,
+            evidence_ids=result.evidence_ids,
+            conflicts=tuple(conflict.description for conflict in result.conflicts),
+            previous_status=previous.status if previous else None, accepted=True, note=note,
+        )
+
+    def record_evaluation(
+        self,
+        *,
+        question_id: str,
+        model: str,
+        run_type: str,
+        run_id: str,
+        answer: str | None,
+        status: str,
+        confidence: float,
+        evidence_ids: Iterable[str] = (),
+        conflicts: Iterable[str] = (),
+        previous_status: str | None = None,
+        accepted: bool = True,
+        note: str | None = None,
+    ) -> None:
+        """Append one evaluation to the immutable history, whether or not it was accepted."""
+        if not question_id.strip() or not model.strip():
+            raise ValueError("an evaluation requires a question ID and a model")
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO question_evaluations
+                   (question_id, model, run_type, run_id, answer, status, confidence, evidence_ids_json,
+                    conflicts_json, previous_status, accepted, note, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (question_id, model.strip(), run_type, run_id, answer, status, float(confidence),
+                 json.dumps(list(dict.fromkeys(evidence_ids))), json.dumps(list(conflicts)),
+                 previous_status, int(accepted), note, _now()),
+            )
+
+    def evaluation_history(self, question_id: str | None = None, run_id: str | None = None) -> tuple[QuestionEvaluation, ...]:
+        query = "SELECT * FROM question_evaluations"
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if question_id:
+            clauses.append("question_id = ?")
+            parameters.append(question_id)
+        if run_id:
+            clauses.append("run_id = ?")
+            parameters.append(run_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, id"
+        with self._connect() as db:
+            rows = db.execute(query, parameters).fetchall()
+        return tuple(QuestionEvaluation(
+            row["id"], row["question_id"], row["model"], row["run_type"], row["run_id"], row["answer"],
+            row["status"], row["confidence"], tuple(json.loads(row["evidence_ids_json"])),
+            tuple(json.loads(row["conflicts_json"])), row["previous_status"], bool(row["accepted"]),
+            row["note"], row["created_at"],
+        ) for row in rows)
+
+    def mark_claims_obsolete(self, claims: Iterable[SecurityClaim], reason: str) -> tuple[str, ...]:
+        """Retire specific claim assertions that a user clarification has superseded.
+
+        Evidence rows are never deleted. Re-extraction reproduces the same signature, so the
+        resolved conflict stays resolved until genuinely new evidence carries the assertion again.
+        """
+        if not reason.strip():
+            raise ValueError("retiring a claim assertion requires a stated reason")
+        timestamp = _now()
+        signatures: list[str] = []
+        with self._connect() as db:
+            for claim in claims:
+                signature = claim_signature(claim.control, claim.attribute, claim.scope, claim.value)
+                existing = db.execute("SELECT evidence_ids_json FROM obsolete_claims WHERE signature = ?", (signature,)).fetchone()
+                known = list(json.loads(existing["evidence_ids_json"])) if existing else []
+                merged = list(dict.fromkeys(known + list(claim.evidence_ids)))
+                db.execute(
+                    """INSERT INTO obsolete_claims VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(signature) DO UPDATE SET evidence_ids_json=excluded.evidence_ids_json,
+                       reason=excluded.reason, resolved_at=excluded.resolved_at""",
+                    (signature, claim.control, claim.subject, claim.attribute, claim.scope,
+                     _json_value(claim.value), json.dumps(merged), reason.strip(), timestamp),
+                )
+                signatures.append(signature)
+        LOGGER.info("Retired %d claim assertion(s) after clarification: %s", len(signatures), reason)
+        return tuple(dict.fromkeys(signatures))
+
+    def obsolete_claims(self, control: str | None = None, subject: str | None = None) -> tuple[ObsoleteClaim, ...]:
+        query = "SELECT * FROM obsolete_claims"
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if control:
+            clauses.append("control_name = ?")
+            parameters.append(control)
+        if subject:
+            clauses.append("subject = ?")
+            parameters.append(subject)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with self._connect() as db:
+            rows = db.execute(query + " ORDER BY resolved_at, signature", parameters).fetchall()
+        return tuple(ObsoleteClaim(
+            row["signature"], row["control_name"], row["subject"], row["attribute_name"], row["scope"],
+            json.loads(row["value_json"]), tuple(json.loads(row["evidence_ids_json"])), row["reason"], row["resolved_at"],
+        ) for row in rows)
+
+    def is_obsolete(self, claim: SecurityClaim) -> bool:
+        """True only when the assertion was retired and carries no evidence unseen at resolution time."""
+        signature = claim_signature(claim.control, claim.attribute, claim.scope, claim.value)
+        with self._connect() as db:
+            row = db.execute("SELECT evidence_ids_json FROM obsolete_claims WHERE signature = ?", (signature,)).fetchone()
+        if row is None:
+            return False
+        # New evidence for a retired assertion is a genuine new finding, not a stale conflict.
+        return set(claim.evidence_ids).issubset(set(json.loads(row["evidence_ids_json"])))
+
+    def record_conflict_candidate(
+        self,
+        *,
+        question_id: str,
+        control: str,
+        model: str,
+        existing_status: str,
+        existing_answer: str | None,
+        proposed_status: str,
+        proposed_answer: str | None,
+        evidence_ids: Iterable[str],
+        reason: str,
+    ) -> None:
+        """Preserve a model result that disagrees with confirmed state instead of applying it."""
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO conflict_candidates
+                   (question_id, control_name, model, existing_status, existing_answer, proposed_status,
+                    proposed_answer, evidence_ids_json, reason, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (question_id, control, model, existing_status, existing_answer, proposed_status,
+                 proposed_answer, json.dumps(list(dict.fromkeys(evidence_ids))), reason, _now()),
+            )
+        LOGGER.info("Recorded conflict candidate for %s; confirmed state was not overwritten", question_id)
+
+    def conflict_candidates(self, question_id: str | None = None) -> tuple[dict[str, Any], ...]:
+        query = "SELECT * FROM conflict_candidates"
+        parameters: tuple[Any, ...] = ()
+        if question_id:
+            query += " WHERE question_id = ?"
+            parameters = (question_id,)
+        with self._connect() as db:
+            rows = db.execute(query + " ORDER BY created_at, id", parameters).fetchall()
+        return tuple({
+            "id": row["id"], "question_id": row["question_id"], "control": row["control_name"],
+            "model": row["model"], "existing_status": row["existing_status"], "existing_answer": row["existing_answer"],
+            "proposed_status": row["proposed_status"], "proposed_answer": row["proposed_answer"],
+            "evidence_ids": list(json.loads(row["evidence_ids_json"])), "reason": row["reason"],
+            "created_at": row["created_at"],
+        } for row in rows)
+
+    def questionnaire_states(self) -> dict[str, QuestionnaireState]:
+        with self._connect() as db:
+            rows = db.execute("SELECT * FROM questionnaire_state").fetchall()
+        return {row["question_id"]: QuestionnaireState(
+            row["question_id"], row["answer"], row["status"], row["confidence"],
+            tuple(json.loads(row["evidence_ids_json"])), tuple(json.loads(row["missing_information_json"])), row["updated_at"],
+        ) for row in rows}
 
     def questionnaire_state(self, question_id: str) -> QuestionnaireState | None:
         with self._connect() as db:
@@ -341,12 +605,14 @@ class SecurityProfile:
         )
 
     def save_confirmed_questionnaire_state(
-        self, question_id: str, answer: str, evidence_ids: Iterable[str], missing_information: Iterable[str] = ()
+        self, question_id: str, answer: str, evidence_ids: Iterable[str], missing_information: Iterable[str] = (),
+        run_type: str = "user_confirmation", model: str | None = None, note: str | None = None,
     ) -> None:
         """Persist a user-confirmed row assembled from validated conversational facts."""
         identifiers = tuple(dict.fromkeys(evidence_ids))
         if not answer.strip() or not identifiers:
             raise ValueError("confirmed questionnaire state requires an answer and evidence")
+        previous = self.questionnaire_state(question_id)
         with self._connect() as db:
             db.execute(
                 """INSERT INTO questionnaire_state VALUES (?, ?, 'USER_CONFIRMED', 0.85, ?, ?, ?)
@@ -355,6 +621,11 @@ class SecurityProfile:
                    missing_information_json=excluded.missing_information_json, updated_at=excluded.updated_at""",
                 (question_id, answer, json.dumps(identifiers), json.dumps(tuple(missing_information)), _now()),
             )
+        self.record_evaluation(
+            question_id=question_id, model=model or "user", run_type=run_type, run_id=run_type,
+            answer=answer, status="USER_CONFIRMED", confidence=0.85, evidence_ids=identifiers,
+            previous_status=previous.status if previous else None, accepted=True, note=note,
+        )
 
     def needs_question(self, question_id: str) -> bool:
         state = self.questionnaire_state(question_id)

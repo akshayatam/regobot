@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from regodit.config import LLM_MODEL, LLM_PROVIDER, OPENAI_API_KEY
+from regodit.config import LLM_PROVIDER, OPENAI_API_KEY, active_model
 from regodit.models import Evidence
 
 if TYPE_CHECKING:
@@ -176,8 +176,10 @@ def validate_model_output(raw: str, evidence: list[Evidence], expected_control: 
 class OpenAIAnalyst:
     """One-provider runtime; disabled cleanly when no OpenAI credential is configured."""
 
-    def __init__(self, client: Any | None = None, model: str = LLM_MODEL):
-        self.model = model
+    def __init__(self, client: Any | None = None, model: str | None = None):
+        # Resolved at construction, never hardcoded, so restarting with a different
+        # OPENAI_MODEL/LLM_MODEL changes only the model runtime.
+        self.model = (model or active_model()).strip()
         self._client = client
         self.last_attempt: dict[str, Any] | None = None
         if self._client is None and self.enabled:

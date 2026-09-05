@@ -223,6 +223,23 @@ class AnalystEngine:
     def flush_traces(self) -> None:
         self.observer.flush()
 
+    def _drop_obsolete(self, claims: list[SecurityClaim]) -> list[SecurityClaim]:
+        """Remove assertions a user clarification already retired, unless new evidence carries them.
+
+        This keeps a resolved conflict resolved across restarts and model retests: the evidence
+        itself is untouched and remains visible in history.
+        """
+        checker = getattr(self.profile, "is_obsolete", None)
+        if not callable(checker):
+            return claims
+        kept: list[SecurityClaim] = []
+        for claim in claims:
+            if checker(claim):
+                LOGGER.info("Skipping retired assertion %s/%s=%r (clarified by the user)", claim.control, claim.attribute, claim.value)
+                continue
+            kept.append(claim)
+        return kept
+
     def investigate(self, item: QuestionnaireItem, organization: str = "Regodit") -> InvestigationResult:
         intent = determine_intent(item)
         LOGGER.info("Checking security profile for %s (%s)", item.id, intent.control)
@@ -292,6 +309,7 @@ class AnalystEngine:
                 LOGGER.warning("Rejected unsupported claim %s: %s", claim.id, exc)
             else:
                 valid_claims.append(claim)
+        valid_claims = self._drop_obsolete(valid_claims)
         conflicts = detect_conflicts(valid_claims)
         cited = tuple(dict.fromkeys(eid for claim in valid_claims for eid in claim.evidence_ids))
         if conflicts:

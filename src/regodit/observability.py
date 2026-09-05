@@ -131,6 +131,84 @@ class PrismObserver:
         except Exception as exc:
             LOGGER.warning("PRISM investigation trajectory was skipped: %s", type(exc).__name__)
 
+    def retest(
+        self,
+        *,
+        question_id: str,
+        control: str,
+        model: str,
+        run_id: str,
+        previous_status: str,
+        new_status: str,
+        conflict_resolved: bool,
+        accepted: bool,
+        decision: str,
+        evidence_count: int,
+    ) -> None:
+        """Trace a model replay so retests are identifiable alongside first-pass investigations."""
+        if not self._client:
+            return
+        steps = [
+            {
+                "step_type": "tool_call",
+                "label": "Replay question against unchanged evidence",
+                "tool_name": "model_retest",
+                "input_summary": f"question_id={question_id}; control={control}; previous_status={previous_status}",
+                "output_summary": f"retrieved_evidence_count={evidence_count}",
+                "duration_ms": 0,
+                "status": "success",
+            },
+            {
+                "step_type": "reasoning",
+                "label": "Evidence-aware retest decision",
+                "input_summary": "Compare the retest result with the stored questionnaire state",
+                "output_summary": f"decision={decision}; accepted={accepted}",
+                "duration_ms": 0,
+                "status": "success",
+            },
+            {
+                "step_type": "final_answer",
+                "label": "Retested questionnaire state",
+                "output_summary": f"question_id={question_id}; new_status={new_status}",
+                "duration_ms": 0,
+                "status": "success",
+            },
+        ]
+        try:
+            receipt = self._client.submit_trajectory(
+                steps,
+                agent_name=PRISMTRACE_AGENT_NAME,
+                agent_id=AGENT_ID,
+                conversation_id=self.session_id,
+                request_id=run_id,
+                model=model,
+                metadata={
+                    "run_type": "model_retest",
+                    "model": model,
+                    "run_id": run_id,
+                    "question_id": question_id,
+                    "previous_status": previous_status,
+                    "new_status": new_status,
+                    "conflict_resolved": conflict_resolved,
+                    "accepted": accepted,
+                    "decision": decision,
+                },
+                async_send=False,
+            )
+            if isinstance(receipt, dict) and receipt.get("id"):
+                self.trajectory_ids.append(str(receipt["id"]))
+        except TypeError:
+            # Older SDK builds accept no trajectory metadata; the trace still identifies the retest.
+            try:
+                self._client.submit_trajectory(
+                    steps, agent_name=PRISMTRACE_AGENT_NAME, agent_id=AGENT_ID,
+                    conversation_id=self.session_id, request_id=run_id, model=model, async_send=False,
+                )
+            except Exception as exc:
+                LOGGER.warning("PRISM retest trajectory was skipped: %s", type(exc).__name__)
+        except Exception as exc:
+            LOGGER.warning("PRISM retest trajectory was skipped: %s", type(exc).__name__)
+
     def flush(self) -> None:
         if not self._client:
             return

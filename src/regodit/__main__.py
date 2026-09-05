@@ -22,6 +22,14 @@ def main() -> None:
     demo = subcommands.add_parser("demo", help="seed the deterministic judging profile")
     demo.add_argument("--db")
     demo.add_argument("--force", action="store_true")
+    retest = subcommands.add_parser("retest", help="re-evaluate questions with the configured model")
+    retest.add_argument("--scope", choices=("unresolved", "all", "selected"), default="unresolved")
+    retest.add_argument("--unresolved", action="store_const", const="unresolved", dest="scope")
+    retest.add_argument("--all", action="store_const", const="all", dest="scope")
+    retest.add_argument("--question", action="append", default=[])
+    retest.add_argument("--db")
+    retest.add_argument("--json", action="store_true")
+    retest.add_argument("--verbose", action="store_true")
     trace_eval = subcommands.add_parser("trace-evaluation", help="run real OpenAI + PRISM evaluation scenarios")
     trace_eval.add_argument("--db")
     trace_eval.add_argument("--force", action="store_true")
@@ -50,6 +58,18 @@ def main() -> None:
             forwarded.append("--analyze")
         sys.argv = forwarded
         serve_main()
+    elif args.command == "retest":
+        from regodit.retest import main as retest_main
+        forwarded = ["--scope", args.scope]
+        for question_id in args.question:
+            forwarded += ["--question", question_id]
+        if args.db:
+            forwarded += ["--db", args.db]
+        if args.json:
+            forwarded.append("--json")
+        if args.verbose:
+            forwarded.append("--verbose")
+        raise SystemExit(retest_main(forwarded))
     elif args.command == "demo":
         from regodit.demo import DEFAULT_DEMO_DB, seed_demo
         path = Path(args.db) if args.db else DEFAULT_DEMO_DB

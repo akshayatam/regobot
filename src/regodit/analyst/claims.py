@@ -31,6 +31,16 @@ CONTROL_PATTERNS = {
 RECOMMENDATION_PREFIXES = ("recommend", "encourage", "consider", "should ", "enable ", "enhance ", "ensure ", "before implementing")
 
 
+def claim_signature(control: str, attribute: str, scope: str, value: bool | str) -> str:
+    """Stable identity for what a claim asserts, independent of which evidence carried it.
+
+    Re-extraction from the same documents reproduces the signature, which lets a resolved
+    conflict stay resolved without deleting the underlying evidence.
+    """
+    payload = "\0".join((control, attribute, scope, repr(value)))
+    return "sig-" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+
+
 def _required(value: str, name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")

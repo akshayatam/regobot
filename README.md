@@ -98,7 +98,7 @@ The command fails non-zero if a source file cannot be ingested or has an unsuppo
 
 ## Configuration
 
-Copy `.env.example` values into your shell or preferred environment loader as needed. Regodit itself does not parse `.env` files and has no required secrets.
+Copy `.env.example` to `.env` and edit it, or export the variables in your shell. Regodit reads `.env` at startup from `REGODIT_PROJECT_ROOT`, the current directory, or the detected checkout, in that order; a real environment variable always wins over the file. There are no required secrets.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
@@ -111,7 +111,8 @@ Copy `.env.example` values into your shell or preferred environment loader as ne
 | `REGODIT_HOST` | UI bind address | `127.0.0.1` |
 | `REGODIT_PORT` | UI port | `8501` |
 | `LLM_PROVIDER` | Primary model provider | `openai` |
-| `LLM_MODEL` | Structured reasoning model | `gpt-5-mini` |
+| `OPENAI_MODEL` | Structured reasoning model; the model switch | `gpt-5-mini` |
+| `LLM_MODEL` | Legacy name for the same setting, used when `OPENAI_MODEL` is unset | `gpt-5-mini` |
 | `OPENAI_API_KEY` | OpenAI API credential | required for model reasoning |
 | `PRISMTRACE_API_KEY` | PRISM API credential | required for tracing |
 | `PRISMTRACE_PROJECT_ID` | Private PRISM project identifier | required for tracing |
@@ -120,7 +121,9 @@ Copy `.env.example` values into your shell or preferred environment loader as ne
 
 ## AI Model
 
-Regodit uses OpenAI `gpt-5-mini` through the Responses API. It was selected as the single MVP provider because it supports strict structured output with low latency and cost for focused evidence-analysis tasks. Set `LLM_MODEL` to another compatible OpenAI model when needed.
+Regodit uses OpenAI `gpt-5-mini` through the Responses API by default. It was selected as the single MVP provider because it supports strict structured output with low latency and cost for focused evidence-analysis tasks. Set `OPENAI_MODEL` to another compatible OpenAI model when needed.
+
+The model name is never hardcoded in business logic. It is resolved from configuration at startup, shown in the sidebar and on the **Model & Retest** view, and recorded on every stored evaluation.
 
 The model interprets retrieved evidence, proposes structured claims, identifies missing information and contradictions, writes one targeted follow-up, and produces a concise answer. It receives only the active question, retrieved evidence, and persisted user-confirmed evidence—not an unrestricted search tool.
 
@@ -182,13 +185,57 @@ regodit demo --force
 regodit serve --db artifacts/demo_security_profile.sqlite3
 ```
 
+## Switching Models and Retesting
+
+Changing the model changes only the reasoning runtime. Evidence, the security profile, user
+confirmations, questionnaire answers, conflict history, and evaluation history all survive a restart.
+
+1. Stop the application.
+2. Edit `OPENAI_MODEL` in `.env` (or export it in your shell).
+3. Restart with `regodit serve`. The active model appears in the sidebar and on **Model & Retest**.
+4. Re-run the questionnaire against the same evidence, from the UI or the command line.
+
+```bash
+regodit retest --scope unresolved      # default: re-runs UNKNOWN and CONFLICT rows
+regodit retest --scope all             # re-runs all 66 questions, for model comparison
+regodit retest --question VSQ-060      # re-runs one question
+```
+
+`python scripts/retest.py --scope unresolved` is an equivalent standalone entry point that works
+without installing the package or starting the UI. Add `--json` for a full machine-readable report.
+
+A retest never clears the questionnaire. Each evaluation is appended to a per-question history with
+its model, status, confidence, evidence IDs, and timestamp, and the questionnaire shows the latest
+accepted state. Retest safety follows an evidence-aware precedence: current operational evidence,
+current assessment evidence, valid current user confirmation, current policy requirement, informal
+observation, and last, model inference. A retest that disagrees with a user-confirmed fact is stored
+as a conflict candidate rather than applied, and an `UNKNOWN → VERIFIED` upgrade that rests on no
+evidence the previous run had not already seen is flagged rather than trusted.
+
+Retests are PRISM-traced with `run_type = model_retest`, the active model, run ID, question ID,
+previous status, new status, and whether a conflict was resolved.
+
+## Questionnaire Synchronization
+
+Every change to durable security knowledge — a clarification, a correction, a resolved conflict, or
+an accepted retest — flows through one synchronizer in `src/regodit/sync.py`. It identifies every
+questionnaire row mapped to the affected control, recomputes each one, and persists the result
+immediately, so a single confirmation updates all related rows and chat state cannot drift away from
+the questionnaire table.
+
+Resolving a conflict supersedes the contradicted claim and records the retired assertion in an audit
+ledger. Because the same assertion is otherwise re-derived from the unchanged source documents on
+every investigation, that ledger is what keeps a resolved conflict resolved across restarts and
+retests. The evidence itself is never deleted, and genuinely new evidence carrying the same
+assertion reopens the conflict rather than being suppressed.
+
 ## Running Tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The suite covers questionnaire parsing, ingestion and stable evidence IDs, retrieval, claim validation, evidence sufficiency, search-before-ask behavior, entity relevance, conflict detection, persistent memory, supersession, HTTP routes, export safety, and the end-to-end demonstration.
+The suite covers questionnaire parsing, ingestion and stable evidence IDs, retrieval, claim validation, evidence sufficiency, search-before-ask behavior, entity relevance, conflict detection, persistent memory, supersession, HTTP routes, export safety, model configuration and restart safety, all three retest scopes, evaluation history, retest precedence, questionnaire synchronization, and the end-to-end demonstration.
 
 ## Demo Scenario
 
@@ -204,6 +251,7 @@ The deterministic demo seeds four auditable states: company evidence produces a 
 ├── pyproject.toml
 ├── .env.example
 ├── data/                         # supplied, immutable evidence
+├── scripts/retest.py             # standalone retest entry point
 ├── prompts/                      # governing development specifications
 ├── artifacts/                    # ignored, reproducible runtime outputs
 ├── src/regodit/
@@ -217,6 +265,8 @@ The deterministic demo seeds four auditable states: company evidence produces a 
 │   ├── observability.py          # fail-open PRISM tracing
 │   ├── memory/                   # SQLite profile and supersession
 │   ├── conversation/             # LangGraph intent, interrupts, thread state
+│   ├── sync.py                   # centralized questionnaire synchronization
+│   ├── retest.py                 # model retest/replay service and CLI
 │   └── ui/                       # HTTP API, browser UI, XLSX export
 └── tests/                        # consolidated automated coverage
 ```
@@ -230,6 +280,9 @@ The deterministic demo seeds four auditable states: company evidence produces a 
 - Intent detection and required-field mappings are deliberately small and deterministic for the hackathon MVP; controls beyond the mapped conversational flows use the existing analyst follow-up behavior.
 - Questionnaire writing targets the supplied workbook's `Vendor Security Responses` layout.
 - Confidence scores rank evidence quality and consistency; they are not statistical probabilities.
+- A retest re-runs the analyst against stored evidence; it does not re-ingest source documents, so new files require `regodit initialize` first.
+- Questionnaire rows are mapped to controls by the normalized topic, so a claim only fans out to rows sharing that normalized control.
+- Conflict candidates raised by a retest are recorded and displayed but are resolved through the existing chat clarification flow rather than a dedicated review queue.
 
 ## Future Improvements
 
