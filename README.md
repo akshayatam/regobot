@@ -21,6 +21,7 @@ Regodit ingests the supplied evidence into stable, source-addressable records, r
 - Confidence and evidence-quality scoring.
 - OpenAI structured reasoning constrained to retrieved Regodit evidence.
 - Block Convey PRISM traces for real model-backed investigations.
+- Chat-first, multi-turn investigations coordinated by a persistent LangGraph thread.
 - JSON and XLSX questionnaire completion without overwriting the source workbook.
 - Entity relevance filtering that excludes known third-party evidence from Regodit claims.
 
@@ -43,6 +44,8 @@ Security Profile
       ↓
 Questionnaire Completion
 ```
+
+LangGraph is a thin conversation coordinator around these services: intent routing → task selection → profile/evidence investigation → answer or human interrupt → response validation → durable profile/questionnaire update. Its SQLite checkpointer stores only conversational execution state; Regodit's separate security-profile database remains the authoritative long-term knowledge store.
 
 Business logic lives under `src/regodit`; the HTTP UI is only a presentation and API layer. Generated manifests, evidence JSONL, databases, reports, and exports live under `artifacts/`. Original files under `data/` are treated as immutable.
 
@@ -67,6 +70,7 @@ Policy intent alone is not treated as proof of implementation. Claims retain the
 - BM25-style lexical scoring plus character-similarity hybrid retrieval
 - OpenAI Responses API with strict JSON-schema output
 - Block Convey `prismtrace-sdk` observability
+- LangGraph with its SQLite checkpointer for interrupt/resume conversation state
 - Poppler `pdftotext` for PDF extraction when PDF files are present
 - `unittest` for automated tests
 
@@ -103,6 +107,7 @@ Copy `.env.example` values into your shell or preferred environment loader as ne
 | `REGODIT_ARTIFACT_DIR` | Generated runtime state | `<root>/artifacts` |
 | `REGODIT_EVIDENCE_PATH` | Evidence JSONL | `<artifacts>/evidence.jsonl` |
 | `REGODIT_PROFILE_DB` | SQLite security profile | `<artifacts>/security_profile.sqlite3` |
+| `REGODIT_CONVERSATION_DB` | LangGraph thread checkpoints | `<artifacts>/conversations.sqlite3` |
 | `REGODIT_HOST` | UI bind address | `127.0.0.1` |
 | `REGODIT_PORT` | UI port | `8501` |
 | `LLM_PROVIDER` | Primary model provider | `openai` |
@@ -125,7 +130,7 @@ The governing model instruction is explicit: answer only from supplied Regodit e
 
 ## PRISM Observability
 
-Regodit uses Block Convey PRISM through `prismtrace-sdk>=0.4.0`. No LangChain or LangGraph layer was added: the native `PRISMtrace` custom client instruments the actual model call inside `AnalystEngine`.
+Regodit uses Block Convey PRISM through `prismtrace-sdk>=0.4.0`. LangGraph coordinates the conversation, while the native `PRISMtrace` custom client continues to instrument the genuine model call and investigation path inside `AnalystEngine`.
 
 For each configured run PRISM receives:
 
@@ -151,6 +156,15 @@ The Observe → Improve → Prove workflow is:
 3. Change the relevant prompt, retrieval, or validator and rerun the same question/session scenario.
 4. Compare the validated status, citations, follow-up, latency, and token use before and after.
 
+The dataset evaluation produced a concrete improvement story:
+
+- **Before:** a traced `VSQ-020` run returned `UNKNOWN`, and a later MFA run let an LLM omission hide a known policy/implementation contradiction.
+- **Observed:** PRISM showed the retrieval → reasoning → final-result path and highlighted limited reasoning transparency; application validation logs showed over-broad claims, unresolved fields attached to answerable output, and inconsistent entity naming. An asynchronous trajectory also exceeded its flush timeout.
+- **Change:** the prompt now limits output to the three strongest question-specific claims, mandates canonical control/attribute/entity values and two-sentence answers, and forbids unresolved fields on answerable results. Validated model claims are merged with conservative extraction so omissions cannot erase conflicts. Trajectories are submitted synchronously and retain server receipt IDs.
+- **After:** `VSQ-020` returned `VERIFIED` with real evidence IDs and no follow-up; the seeded MFA gap returned `CONFLICT` with a clarification question. Both receipt-backed PRISM trajectories completed with passing evaluations and an overall score of 98.89.
+
+PRISM also reported that project-level authorized-tool and task-constraint lists were not configured. Those governance controls belong in the private PRISM project configuration; Regodit does not invent unsupported trace fields to simulate them.
+
 ## Running Regodit
 
 After initialization, launch the application:
@@ -159,7 +173,7 @@ After initialization, launch the application:
 regodit serve
 ```
 
-Open <http://127.0.0.1:8501>. Add `--analyze` to investigate all questionnaire items before serving, or use `--host`, `--port`, and `--db` for runtime overrides.
+Open <http://127.0.0.1:8501>. The conversation is the primary workspace; Questionnaire, Security Profile, Conflicts, and Evidence are supporting views. Suggested actions start or continue prioritized investigations, and every unresolved questionnaire row can launch an evidence search in chat. Add `--analyze` to investigate all questionnaire items before serving, or use `--host`, `--port`, and `--db` for runtime overrides.
 
 For the deterministic judging scenario:
 
@@ -202,6 +216,7 @@ The deterministic demo seeds four auditable states: company evidence produces a 
 │   ├── llm/                      # grounded OpenAI structured-output runtime
 │   ├── observability.py          # fail-open PRISM tracing
 │   ├── memory/                   # SQLite profile and supersession
+│   ├── conversation/             # LangGraph intent, interrupts, thread state
 │   └── ui/                       # HTTP API, browser UI, XLSX export
 └── tests/                        # consolidated automated coverage
 ```
@@ -212,6 +227,7 @@ The deterministic demo seeds four auditable states: company evidence produces a 
 - PNG files are retained as visual evidence with provenance but are not OCR-transcribed.
 - PDF extraction depends on the external `pdftotext` executable.
 - The local HTTP server has no authentication and is intended for a trusted workstation/demo environment.
+- Intent detection and required-field mappings are deliberately small and deterministic for the hackathon MVP; controls beyond the mapped conversational flows use the existing analyst follow-up behavior.
 - Questionnaire writing targets the supplied workbook's `Vendor Security Responses` layout.
 - Confidence scores rank evidence quality and consistency; they are not statistical probabilities.
 
