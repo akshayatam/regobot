@@ -18,15 +18,13 @@ from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree as ET
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from regodit.analyst import AnalystEngine, InvestigationResult, SecurityClaim, normalize_control
-from regodit.config import ARTIFACT_DIR, CONVERSATION_DB, DATA_DIR, HOST, PORT, PROFILE_DB, active_model, model_source
+from regodit.analyst import AnalystEngine, InvestigationResult, normalize_control
+from regodit.config import ARTIFACT_DIR, CONVERSATION_DB, DATA_DIR, HOST, PORT, PROFILE_DB
 from regodit.conversation import AnalystState, ConversationService
 from regodit.ingestion import load_repository
 from regodit.memory import SecurityProfile
 from regodit.models import QuestionnaireItem
 from regodit.questionnaire import QUESTIONNAIRE_NAME, parse_questionnaire
-from regodit.retest import SCOPES, RetestService
-from regodit.sync import QuestionnaireSynchronizer
 
 DEFAULT_DB = PROFILE_DB
 ROOT = ARTIFACT_DIR.parent
@@ -132,8 +130,6 @@ class AppService:
                 "conversation", "chat", 1, "chat",
             )
         }
-        self.synchronizer = QuestionnaireSynchronizer(self.items, self.profile, self.engine)
-        self.retester = RetestService(self.items, self.profile, self.engine, self.synchronizer)
         self.chat = ConversationService(self, checkpoint_path)
 
     def close(self) -> None:
@@ -282,30 +278,18 @@ class AppService:
             claims.append(claim)
         return claims
 
-    def _update_control_rows(self, control: str, claims: list[Any], reason: str = "security profile change") -> list[str]:
-        """Single entry point for questionnaire synchronization after a profile change."""
-        changes = self.synchronizer.synchronize_control(control, reason)
-        self.last_row_changes = [change.to_dict() for change in changes]
-        return [change.question_id for change in changes]
-
-    @staticmethod
-    def _contradicting_claims(state: AnalystState, control: str, value: Any) -> list[SecurityClaim]:
-        """Rebuild the conflicting claims a clarification retires, from the live investigation state."""
-        conflict_ids = set(state.get("conflict_ids") or ())
-        retired: list[SecurityClaim] = []
-        for record in state.get("current_claims", []) or []:
-            if record.get("id") not in conflict_ids or record.get("control") != control:
-                continue
-            if record.get("value") == value:
-                continue
-            retired.append(SecurityClaim(
-                id=record["id"], control=record["control"], attribute=record["attribute"], scope=record["scope"],
-                value=record["value"], subject=record["subject"], strength=record["strength"],
-                evidence_type=record["evidence_type"], evidence_ids=tuple(record["evidence_ids"]),
-                support_text=record["support_text"], evidence_weight=record["evidence_weight"],
-                relevant_dates=tuple(record.get("relevant_dates", ())),
-            ))
-        return retired
+    def _update_control_rows(self, control: str, claims: list[Any]) -> list[str]:
+        active = self.profile.lookup(control, "Regodit").claims
+        if not active:
+            return []
+        answer = "; ".join(f"{claim.attribute}={claim.value}" for claim in active)
+        evidence_ids = [identifier for claim in active for identifier in claim.evidence_ids]
+        affected = []
+        for item in self.items:
+            if normalize_control(item.normalized_control) == control:
+                self.profile.save_confirmed_questionnaire_state(item.id, answer, evidence_ids)
+                affected.append(item.id)
+        return affected
 
     def process_chat_response(self, state: AnalystState, response: str) -> dict[str, Any]:
         control = state.get("active_control") or ""
@@ -354,12 +338,7 @@ class AppService:
             active = [entry for entry in self.profile.claim_history(control) if entry.status == "ACTIVE" and isinstance(entry.claim.value, bool) and entry.claim.value != value]
             supersedes = active[-1].claim.id if active else None
             claim = self.profile.record_user_claim(control, "implemented", value, "organization-wide/unspecified", response, "conversation user", supersedes=supersedes)
-            # Retire the contradicted assertion so re-investigation and model retests do not
-            # resurrect the resolved conflict from the same unchanged evidence.
-            retired = self._contradicting_claims(state, control, value)
-            if retired:
-                self.profile.mark_claims_obsolete(retired, f"Clarified by the user: {response.strip()}")
-            affected = self._update_control_rows(control, [claim], "conflict resolved by user clarification")
+            affected = self._update_control_rows(control, [claim])
             return {"pending_question": None, "pending_payload": None, "conflict_ids": [], "investigation_status": "USER_CONFIRMED",
                     "last_user_confirmation": claim.to_dict(), "message": {"role": "assistant", "content": f"Conflict resolved. I recorded the current state, preserved the earlier evidence in history, and updated {len(affected)} questionnaire item(s).", "action": "UPDATE", "status": "USER_CONFIRMED"}}
         question_id = state.get("active_question_id")
@@ -543,25 +522,12 @@ class AppService:
 
     def voice_record(self, question_id: str, response: str, stakeholder: str | None = None) -> dict[str, Any]:
         result = self.submit_follow_up(question_id, response, stakeholder)
-        # A spoken confirmation is the same durable fact as a typed one, so it must fan out
-        # through the central synchronizer. Without this the voice channel would update one
-        # row while chat updated every row mapped to the control - exactly the drift the
-        # questionnaire synchronization phase exists to prevent.
-        affected: list[str] = []
-        if result.status in {"USER_CONFIRMED", "VERIFIED"} and hasattr(self, "synchronizer"):
-            control = normalize_control(self._item(question_id).normalized_control)
-            changes = self.synchronizer.synchronize_control(control, "voice confirmation")
-            affected = [change.question_id for change in changes]
-        spoken = ("Recorded. I will not ask that again."
-                  if result.status in {"USER_CONFIRMED", "VERIFIED"}
-                  else f"I still need something more specific. {result.follow_up_question or ''}".strip())
-        if len(affected) > 1:
-            spoken = f"Recorded. That also answered {len(affected) - 1} related question"                      f"{'s' if len(affected) > 2 else ''}. I will not ask those again."
         return {
-            "spoken_answer": spoken,
+            "spoken_answer": ("Recorded. I will not ask that again."
+                              if result.status in {"USER_CONFIRMED", "VERIFIED"}
+                              else f"I still need something more specific. {result.follow_up_question or ''}".strip()),
             "status": result.status,
             "question_id": result.question_id,
-            "affected_questions": affected,
         }
 
     def submit_follow_up(self, question_id: str, response: str, stakeholder: str | None) -> InvestigationResult:
@@ -592,47 +558,14 @@ class AppService:
             if not corrected_value:
                 raise ValueError("corrected value cannot be blank")
         new_claim = self.profile.correct_claim(claim_id, corrected_value, raw_response, stakeholder)
-        # A correction retires the previous assertion so it cannot be re-derived as a fresh conflict.
-        self.profile.mark_claims_obsolete([prior], f"Corrected by the user: {raw_response.strip()}")
-        changes = self.synchronizer.synchronize_control(prior.control, "user correction")
+        affected = []
+        for item in self.items:
+            if normalize_control(item.normalized_control) == prior.control:
+                result = self.engine.investigate(item)
+                self.profile.save_questionnaire_result(result)
+                affected.append(item.id)
         self.export()
-        return {
-            "new_claim": new_claim.to_dict(), "superseded_claim_id": claim_id,
-            "affected_questions": [change.question_id for change in changes],
-            "row_changes": [change.to_dict() for change in changes],
-        }
-
-    def model_info(self) -> dict[str, Any]:
-        """Report the model the running process is actually configured to use."""
-        runtime = self.engine.model_runtime
-        history = self.profile.evaluation_history()
-        return {
-            "active_model": runtime.model,
-            "configured_model": active_model(),
-            "source": model_source(),
-            "provider": "openai",
-            "enabled": runtime.enabled,
-            "fallback": "deterministic evidence-only analysis" if not runtime.enabled else None,
-            "previous_models": sorted({entry.model for entry in history if entry.accepted and entry.model not in {runtime.model, "user"}}),
-            "retest_scopes": list(SCOPES),
-        }
-
-    def retest(self, scope: str = "unresolved", question_ids: list[str] | None = None) -> dict[str, Any]:
-        report = self.retester.run(scope, question_ids).summary()
-        self.export()
-        report["progress"] = self.dashboard()["progress"]
-        return report
-
-    def history(self, question_id: str) -> dict[str, Any]:
-        item = self._item(question_id)
-        state = self.profile.questionnaire_state(question_id)
-        return {
-            "question_id": question_id,
-            "question": item.question,
-            "current_status": state.status if state else "UNKNOWN",
-            "evaluations": [entry.to_dict() for entry in self.profile.evaluation_history(question_id)],
-            "conflict_candidates": list(self.profile.conflict_candidates(question_id)),
-        }
+        return {"new_claim": new_claim.to_dict(), "superseded_claim_id": claim_id, "affected_questions": affected}
 
     def evidence(self, identifiers: list[str]) -> list[dict[str, Any]]:
         profile_records = {item.id: item for item in self.profile.get_evidence(identifiers)}
@@ -674,8 +607,6 @@ class AppService:
             "questions": rows,
             "active_user_claims": active_user_claims,
             "status_labels": STATUS_LABELS,
-            "model": self.model_info(),
-            "conflict_candidates": list(self.profile.conflict_candidates()),
         }
 
     def export(self) -> dict[str, str]:
@@ -727,17 +658,6 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/chat":
             thread_id = parse_qs(parsed.query).get("thread_id", ["default"])[0]
             self._json(self.service.opening(thread_id))
-        elif parsed.path == "/api/model":
-            self._json(self.service.model_info())
-        elif parsed.path == "/api/history":
-            question_id = parse_qs(parsed.query).get("question_id", [""])[0]
-            if not question_id:
-                self._json({"error": "question_id is required"}, HTTPStatus.BAD_REQUEST)
-                return
-            try:
-                self._json(self.service.history(question_id))
-            except ValueError as exc:
-                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         elif parsed.path.startswith("/download/"):
             kind = parsed.path.rsplit("/", 1)[-1]
             paths = self.service.export()
@@ -778,8 +698,6 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.service.submit_follow_up(body["question_id"], body["response"], body.get("stakeholder")).to_dict()
             elif self.path == "/api/correct":
                 payload = self.service.correct(body["claim_id"], body["value"], body["raw_response"], body.get("stakeholder"))
-            elif self.path == "/api/retest":
-                payload = self.service.retest(body.get("scope", "unresolved"), body.get("question_ids"))
             elif self.path == "/api/export":
                 payload = self.service.export()
             elif self.path == "/api/voice-ask":
@@ -855,14 +773,13 @@ function showError(e){document.getElementById('result').innerHTML=`<div class="p
 
 INDEX_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Regodit AI Security Analyst</title><style>
-:root{--bg:#f6f7fb;--side:#101827;--card:#fff;--line:#e4e7ec;--text:#182230;--muted:#667085;--brand:#4255d4;--green:#087443;--amber:#a15c00;--red:#b42318}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px Inter,system-ui,sans-serif}.app{display:grid;grid-template-columns:235px 1fr;height:100vh}.side{background:var(--side);color:#fff;padding:22px 16px;display:flex;flex-direction:column;gap:8px}.logo{font-size:21px;font-weight:800;padding:4px 8px 20px}.side button{background:transparent;color:#d5d9e3;border:0;text-align:left;padding:11px;border-radius:8px;cursor:pointer;font:inherit}.side button:hover,.side button.active{background:#273449;color:white}.progress{margin-top:auto;background:#1d2939;border-radius:10px;padding:13px;color:#d0d5dd}.progress b{display:block;color:#fff;font-size:18px;margin-bottom:5px}.main{min-width:0;height:100vh}.view{display:none;height:100%}.view.active{display:flex}.chat{flex-direction:column;max-width:930px;margin:auto;background:white;border-left:1px solid var(--line);border-right:1px solid var(--line)}.top{padding:18px 24px;border-bottom:1px solid var(--line);font-weight:750}.messages{flex:1;overflow:auto;padding:28px 9%;display:flex;flex-direction:column;gap:22px}.msg{max-width:82%;line-height:1.55}.msg.user{align-self:flex-end;background:#eef0ff;padding:12px 15px;border-radius:15px}.msg.assistant{align-self:flex-start}.status{font-size:12px;font-weight:800;margin-bottom:5px}.VERIFIED{color:var(--green)}.USER_CONFIRMED{color:#6941c6}.UNKNOWN{color:var(--amber)}.CONFLICT{color:var(--red)}details{margin-top:9px;border:1px solid var(--line);border-radius:9px;padding:9px;background:#fafafa}.source{padding:8px 0;border-top:1px solid var(--line)}.source small{color:var(--muted)}.composer{border-top:1px solid var(--line);padding:14px 7% 20px}.suggestions{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:10px}.suggestions button,.ask,.generate{border:1px solid var(--line);background:white;border-radius:20px;padding:8px 12px;cursor:pointer}.input{display:flex;gap:9px}.input textarea{resize:none;min-height:50px;max-height:120px;flex:1;border:1px solid #cfd4dc;border-radius:14px;padding:14px;font:inherit}.send{background:var(--brand);color:#fff;border:0;border-radius:13px;padding:0 22px;font-weight:700;cursor:pointer}.workspace{padding:28px;overflow:auto;width:100%}.workspace h1{margin-top:0}.toolbar{display:flex;justify-content:space-between;align-items:center}.generate{background:var(--brand);color:#fff;border-color:var(--brand);border-radius:8px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}a.ask{text-decoration:none;color:var(--text);display:inline-block;white-space:nowrap}a.ask:hover{background:#f2f4f7}.table{background:#fff;border:1px solid var(--line);border-radius:12px;overflow:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:12px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted)}.pill{font-weight:800;font-size:11px}.muted{color:var(--muted)}.modelbar{margin-top:10px;background:#1d2939;border-radius:10px;padding:11px;color:#98a2b3;font-size:12px;line-height:1.5}.modelbar b{display:block;color:#fff;font-size:13px}.retest,.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px;margin:16px 0}.scopes{display:flex;flex-direction:column;gap:7px;margin:8px 0 12px}.scopes label{font-weight:400;cursor:pointer}#retestQuestion,#historyQuestion{max-width:100%;padding:9px;border:1px solid var(--line);border-radius:8px;margin-bottom:12px}.stat{display:inline-block;margin:0 18px 8px 0}.stat b{display:block;font-size:20px}.flag{color:var(--red);font-weight:700}.timeline{border-left:2px solid var(--line);padding-left:14px;margin-top:8px}.timeline div{padding:6px 0}@media(max-width:720px){.app{grid-template-columns:76px 1fr}.side button{font-size:0}.side button:first-letter{font-size:16px}.logo{font-size:0}.logo:first-letter{font-size:22px}.progress{display:none}.messages{padding:20px}}
-</style></head><body><div class="app"><aside class="side"><div class="logo">Regodit</div><button class="nav active" data-view="chat">💬 Conversation</button><button class="nav" data-view="questionnaire">▦ Questionnaire</button><button class="nav" data-view="profile">◉ Security Profile</button><button class="nav" data-view="conflicts">⚠ Conflicts</button><button class="nav" data-view="evidence">⌕ Evidence</button><button class="nav" data-view="model">⟳ Model &amp; Retest</button><div class="progress" id="progress"></div><div class="modelbar" id="modelbar"></div></aside><main class="main">
+:root{--bg:#f6f7fb;--side:#101827;--card:#fff;--line:#e4e7ec;--text:#182230;--muted:#667085;--brand:#4255d4;--green:#087443;--amber:#a15c00;--red:#b42318}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px Inter,system-ui,sans-serif}.app{display:grid;grid-template-columns:235px 1fr;height:100vh}.side{background:var(--side);color:#fff;padding:22px 16px;display:flex;flex-direction:column;gap:8px}.logo{font-size:21px;font-weight:800;padding:4px 8px 20px}.side button{background:transparent;color:#d5d9e3;border:0;text-align:left;padding:11px;border-radius:8px;cursor:pointer;font:inherit}.side button:hover,.side button.active{background:#273449;color:white}.progress{margin-top:auto;background:#1d2939;border-radius:10px;padding:13px;color:#d0d5dd}.progress b{display:block;color:#fff;font-size:18px;margin-bottom:5px}.main{min-width:0;height:100vh}.view{display:none;height:100%}.view.active{display:flex}.chat{flex-direction:column;max-width:930px;margin:auto;background:white;border-left:1px solid var(--line);border-right:1px solid var(--line)}.top{padding:18px 24px;border-bottom:1px solid var(--line);font-weight:750}.messages{flex:1;overflow:auto;padding:28px 9%;display:flex;flex-direction:column;gap:22px}.msg{max-width:82%;line-height:1.55}.msg.user{align-self:flex-end;background:#eef0ff;padding:12px 15px;border-radius:15px}.msg.assistant{align-self:flex-start}.status{font-size:12px;font-weight:800;margin-bottom:5px}.VERIFIED{color:var(--green)}.USER_CONFIRMED{color:#6941c6}.UNKNOWN{color:var(--amber)}.CONFLICT{color:var(--red)}details{margin-top:9px;border:1px solid var(--line);border-radius:9px;padding:9px;background:#fafafa}.source{padding:8px 0;border-top:1px solid var(--line)}.source small{color:var(--muted)}.composer{border-top:1px solid var(--line);padding:14px 7% 20px}.suggestions{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:10px}.suggestions button,.ask,.generate{border:1px solid var(--line);background:white;border-radius:20px;padding:8px 12px;cursor:pointer}.input{display:flex;gap:9px}.input textarea{resize:none;min-height:50px;max-height:120px;flex:1;border:1px solid #cfd4dc;border-radius:14px;padding:14px;font:inherit}.send{background:var(--brand);color:#fff;border:0;border-radius:13px;padding:0 22px;font-weight:700;cursor:pointer}.workspace{padding:28px;overflow:auto;width:100%}.workspace h1{margin-top:0}.toolbar{display:flex;justify-content:space-between;align-items:center}.generate{background:var(--brand);color:#fff;border-color:var(--brand);border-radius:8px}.table{background:#fff;border:1px solid var(--line);border-radius:12px;overflow:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:12px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted)}.pill{font-weight:800;font-size:11px}.muted{color:var(--muted)}@media(max-width:720px){.app{grid-template-columns:76px 1fr}.side button{font-size:0}.side button:first-letter{font-size:16px}.logo{font-size:0}.logo:first-letter{font-size:22px}.progress{display:none}.messages{padding:20px}}
+</style></head><body><div class="app"><aside class="side"><div class="logo">Regodit</div><button class="nav active" data-view="chat">💬 Conversation</button><button class="nav" data-view="questionnaire">▦ Questionnaire</button><button class="nav" data-view="profile">◉ Security Profile</button><button class="nav" data-view="conflicts">⚠ Conflicts</button><button class="nav" data-view="evidence">⌕ Evidence</button><div class="progress" id="progress"></div></aside><main class="main">
 <section id="chat" class="view chat active"><div class="top">Regodit <span class="muted">· AI Security Analyst</span></div><div class="messages" id="messages"></div><div class="composer"><div class="suggestions" id="suggestions"></div><div class="input"><textarea id="input" placeholder="Ask Regodit or answer the pending question…"></textarea><button class="send" onclick="send()">Send</button></div></div></section>
-<section id="questionnaire" class="view workspace"><div><div class="toolbar"><div><h1>Questionnaire</h1><p class="muted">Evidence-backed status and completion queue.</p></div><div class="actions"><a class="ask" href="/download/json" download>&#8681; Save as JSON</a><a class="ask" href="/download/xlsx" download>&#8681; Save as Excel</a><button class="generate" onclick="sendAction('Generate questionnaire')">Generate Questionnaire</button></div></div><div class="table"><table><thead><tr><th>ID</th><th>Question</th><th>Answer</th><th>Status</th><th>Action</th></tr></thead><tbody id="questions"></tbody></table></div></div></section>
+<section id="questionnaire" class="view workspace"><div><div class="toolbar"><div><h1>Questionnaire</h1><p class="muted">Evidence-backed status and completion queue.</p></div><button class="generate" onclick="sendAction('Generate questionnaire')">Generate Questionnaire</button></div><div class="table"><table><thead><tr><th>ID</th><th>Question</th><th>Answer</th><th>Status</th><th>Action</th></tr></thead><tbody id="questions"></tbody></table></div></div></section>
 <section id="profile" class="view workspace"><div><h1>Security Profile</h1><p class="muted">Durable employee-confirmed facts. Corrections retain audit history.</p><div id="claims"></div></div></section>
 <section id="conflicts" class="view workspace"><div><h1>Conflicts</h1><div id="conflictRows"></div></div></section>
 <section id="evidence" class="view workspace"><div><h1>Evidence</h1><p class="muted">Sources are shown compactly with each verified conversational answer.</p></div></section>
-<section id="model" class="view workspace"><div><h1>Model &amp; Retest</h1><p class="muted">Replay questions against the same evidence with the model this process is configured to use.</p><div id="modelPanel"></div><div class="retest"><h2>Retest with current model</h2><div id="retestModel" class="muted"></div><label>Scope</label><div class="scopes"><label><input type="radio" name="scope" value="unresolved" checked> Unresolved questions only (UNKNOWN and CONFLICT)</label><label><input type="radio" name="scope" value="all"> All questions</label><label><input type="radio" name="scope" value="selected"> Selected question</label></div><select id="retestQuestion"></select><button class="generate" id="retestButton" onclick="runRetest()">Run Retest</button><div id="retestResult"></div></div><h2>Change history</h2><label>Question</label><select id="historyQuestion" onchange="loadHistory()"></select><div id="historyResult"></div></div></section>
 </main></div><script>
 let dashboard,thread=localStorage.regoditThread||(localStorage.regoditThread=crypto.randomUUID());const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const j=await r.json();if(!r.ok)throw Error(j.error||r.statusText);return j}
@@ -874,16 +791,9 @@ function renderSuggestions(items){document.getElementById('suggestions').innerHT
 function renderProgress(p){if(!p)return;document.getElementById('progress').innerHTML=`<b>${p.completed} / ${p.total} complete</b>${p.unknown} unknown · ${p.conflicts} conflicts`}
 async function send(){const input=document.getElementById('input'),value=input.value.trim();if(!value)return;input.value='';try{renderChat(await api('/api/chat',{thread_id:thread,message:value}));await loadDashboard();show('chat')}catch(e){alert(e.message)}}function sendAction(value){document.getElementById('input').value=value;send()}
 function ask(id){sendAction(`Investigate ${id}`)}
-function retestOne(id){show('model');document.querySelector('input[name=scope][value=selected]').checked=true;document.getElementById('retestQuestion').value=id;runRetest()}
-function showHistory(id){show('model');document.getElementById('historyQuestion').value=id;loadHistory()}
-async function loadDashboard(){dashboard=await api('/api/dashboard');renderProgress(dashboard.progress);document.getElementById('questions').innerHTML=dashboard.questions.map(q=>`<tr><td>${q.id}</td><td><b>${esc(q.category)}</b><br>${esc(q.question)}</td><td>${esc(q.answer||'—')}</td><td><span class="pill ${q.status}">${label(q.status)}</span></td><td>${q.status==='UNKNOWN'||q.status==='CONFLICT'?`<button class="ask" onclick="ask('${q.id}')">Ask Regodit</button> `:''}<button class="ask" onclick="retestOne('${q.id}')">Retest</button> <button class="ask" onclick="showHistory('${q.id}')">History</button></td></tr>`).join('');document.getElementById('claims').innerHTML=dashboard.active_user_claims.map(c=>`<details open><summary><b>${esc(c.control)} · ${esc(c.attribute)}</b></summary><p>${esc(c.value)} · ${esc(c.scope)}</p></details>`).join('')||'<p>No employee-confirmed facts yet.</p>';let conflicts=dashboard.questions.filter(q=>q.status==='CONFLICT');document.getElementById('conflictRows').innerHTML=conflicts.map(q=>`<details open><summary>${q.id} · ${esc(q.question)}</summary><p>${esc(q.answer||'Conflicting evidence requires clarification.')}</p><button class="ask" onclick="ask('${q.id}')">Resolve in chat</button></details>`).join('')||'<p>No unresolved conflicts.</p>';renderModel(dashboard.model);questionOptions()}
-function renderModel(m){if(!m)return;document.getElementById('modelbar').innerHTML=`<b>Active model</b>${esc(m.active_model)}<br><span>${esc(m.source==='default'?'built-in default':m.source)}${m.enabled?'':' · deterministic fallback (no API key)'}</span>`;document.getElementById('retestModel').innerHTML=`Current model: <b>${esc(m.active_model)}</b>`;document.getElementById('modelPanel').innerHTML=`<div class="card"><div class="stat"><b>${esc(m.active_model)}</b>Active model</div><div class="stat"><b>${esc(m.source)}</b>Configured via</div><div class="stat"><b>${m.enabled?'model-backed':'deterministic'}</b>Reasoning mode</div>${m.previous_models.length?`<div class="stat"><b>${esc(m.previous_models.join(', '))}</b>Previously used</div>`:''}<p class="muted">Set <code>OPENAI_MODEL</code> in <code>.env</code> and restart the app to switch models. The security profile, questionnaire answers, confirmations, evidence, and history are preserved.</p></div>`}
-function questionOptions(){const rows=(dashboard&&dashboard.questions)||[];const html=rows.map(q=>`<option value="${q.id}">${q.id} · ${esc(q.question).slice(0,90)}</option>`).join('');for(const id of ['retestQuestion','historyQuestion']){const el=document.getElementById(id);if(!el)continue;const old=el.value;el.innerHTML=html;if(old)el.value=old}}
-async function runRetest(){const scope=document.querySelector('input[name=scope]:checked').value;const button=document.getElementById('retestButton');const out=document.getElementById('retestResult');button.disabled=true;out.innerHTML='<p class="muted">Replaying questions against the stored evidence…</p>';try{const body={scope};if(scope==='selected')body.question_ids=[document.getElementById('retestQuestion').value];const r=await api('/api/retest',body);const rows=(r.changes||[]).map(c=>`<tr><td>${c.question_id}</td><td>${esc(c.previous_status)} (${esc(c.previous_model||'—')})</td><td>${esc(c.new_status)} (${esc(c.model)})</td><td>${c.new_evidence_ids.length} source(s)</td><td>${esc(c.note)}</td></tr>`).join('');const flags=(r.suspicious_upgrades||[]).length?`<p class="flag">Flagged — resolved without evidence the previous run had not already seen: ${esc(r.suspicious_upgrades.join(', '))}. A newer result is not better merely because it resolves more questions.</p>`:'';out.innerHTML=`<div class="card"><h3>Retest complete</h3><div class="stat"><b>${r.evaluated}</b>Questions evaluated</div><div class="stat"><b>${r.newly_resolved}</b>Newly resolved</div><div class="stat"><b>${r.still_unknown}</b>Still unknown</div><div class="stat"><b>${r.conflicts_resolved}</b>Conflicts resolved</div><div class="stat"><b>${r.new_conflicts}</b>New conflicts</div><div class="stat"><b>${r.not_applied}</b>Existing state kept</div><p class="muted">Previous model: ${esc((r.previous_models||[]).join(', ')||'—')} · Current model: ${esc(r.model)}</p><p class="muted">Before: ${r.before.resolved} resolved, ${r.before.unknown} unknown, ${r.before.conflict} conflict · After: ${r.after.resolved} resolved, ${r.after.unknown} unknown, ${r.after.conflict} conflict</p>${flags}${rows?`<details open><summary>View changes (${r.changes.length})</summary><table><thead><tr><th>ID</th><th>Previous</th><th>Current</th><th>Evidence</th><th>Reason</th></tr></thead><tbody>${rows}</tbody></table></details>`:'<p class="muted">No questionnaire row changed status.</p>'}</div>`;await loadDashboard()}catch(e){out.innerHTML=`<p class="flag">${esc(e.message)}</p>`}finally{button.disabled=false}}
-async function loadHistory(){const id=document.getElementById('historyQuestion').value;if(!id)return;const out=document.getElementById('historyResult');try{const h=await api('/api/history?question_id='+encodeURIComponent(id));const rows=h.evaluations.map(e=>`<div><b>${esc(e.created_at.slice(0,19).replace('T',' '))}</b> · ${esc(e.status)}${e.accepted?'':' (not applied)'}<br><small class="muted">${esc(e.run_type)} · model ${esc(e.model)} · ${e.evidence_ids.length} source(s)${e.note?' · '+esc(e.note):''}</small></div>`).join('');const cands=h.conflict_candidates.map(c=>`<div class="flag">Model ${esc(c.model)} proposed ${esc(c.proposed_status)} against confirmed ${esc(c.existing_status)} — kept, not applied.</div>`).join('');out.innerHTML=`<div class="card"><h3>${esc(h.question_id)} · current status ${esc(h.current_status)}</h3><div class="timeline">${rows||'<div class="muted">No recorded evaluations yet.</div>'}</div>${cands}</div>`}catch(e){out.innerHTML=`<p class="flag">${esc(e.message)}</p>`}}
+async function loadDashboard(){dashboard=await api('/api/dashboard');renderProgress(dashboard.progress);document.getElementById('questions').innerHTML=dashboard.questions.map(q=>`<tr><td>${q.id}</td><td><b>${esc(q.category)}</b><br>${esc(q.question)}</td><td>${esc(q.answer||'—')}</td><td><span class="pill ${q.status}">${label(q.status)}</span></td><td>${q.status==='UNKNOWN'||q.status==='CONFLICT'?`<button class="ask" onclick="ask('${q.id}')">Ask Regodit</button>`:'—'}</td></tr>`).join('');document.getElementById('claims').innerHTML=dashboard.active_user_claims.map(c=>`<details open><summary><b>${esc(c.control)} · ${esc(c.attribute)}</b></summary><p>${esc(c.value)} · ${esc(c.scope)}</p></details>`).join('')||'<p>No employee-confirmed facts yet.</p>';let conflicts=dashboard.questions.filter(q=>q.status==='CONFLICT');document.getElementById('conflictRows').innerHTML=conflicts.map(q=>`<details open><summary>${q.id} · ${esc(q.question)}</summary><p>${esc(q.answer||'Conflicting evidence requires clarification.')}</p><button class="ask" onclick="ask('${q.id}')">Resolve in chat</button></details>`).join('')||'<p>No unresolved conflicts.</p>'}
 document.getElementById('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});Promise.all([api('/api/chat?thread_id='+encodeURIComponent(thread)).then(renderChat),loadDashboard()]);
 </script>
-<style>elevenlabs-convai{position:fixed;right:16px;bottom:16px;z-index:60}.composer{padding-bottom:150px}.workspace{padding-bottom:160px}@media(max-width:720px){.composer{padding-bottom:140px}}</style>
 <elevenlabs-convai agent-id="agent_1601m1s5w1r1e2zvq2zzp5ez0w26"></elevenlabs-convai>
 <script src="https://unpkg.com/@elevenlabs/convai-widget-embed" async type="text/javascript"></script>
 </body></html>'''
