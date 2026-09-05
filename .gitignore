@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments and local configuration
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Generated runtime/build state
+artifacts/*
+!artifacts/.gitkeep
+*.log
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
+# Folders
+prompts/
