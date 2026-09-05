@@ -19,11 +19,12 @@ class UiTests(unittest.TestCase):
         self.original_hash = hashlib.sha256(self.service.source.read_bytes()).hexdigest()
 
     def tearDown(self):
+        self.service.close()
         self.temp.cleanup()
 
     def test_ui_explains_views_statuses_evidence_conflicts_and_corrections(self):
-        for text in ("Investigation", "Questionnaire work queue", "Security profile", "Verified from company evidence",
-                     "Confirmed by user", "Unknown / needs confirmation", "Conflict", "Correct this fact", "Export XLSX"):
+        for text in ("Conversation", "Questionnaire", "Security Profile", "Verified from company information",
+                     "Confirmed by user", "Unknown / needs confirmation", "Conflicts", "Ask Regodit", "Generate Questionnaire"):
             self.assertIn(text, INDEX_HTML)
 
     def test_dynamic_progress_and_visible_evidence(self):
@@ -49,6 +50,7 @@ class UiTests(unittest.TestCase):
         self.assertEqual([entry.status for entry in history], ["SUPERSEDED", "ACTIVE"])
         self.assertEqual(correction["superseded_claim_id"], claim.id)
         self.assertTrue(reopened.dashboard()["progress"]["user_confirmed"] >= 1)
+        reopened.close()
 
     def test_exports_machine_readable_json_and_completed_xlsx_copy(self):
         self.service.investigate("VSQ-020")

@@ -2,7 +2,8 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from regodit.analyst import AnalystEngine
+from regodit.analyst import AnalystEngine, ProfileEvidence
+from regodit.analyst.claims import SecurityClaim
 from regodit.llm.runtime import OpenAIAnalyst, StructuredOutputError, validate_model_output
 from regodit.models import Evidence, QuestionnaireItem
 from regodit.observability import PrismObserver
@@ -61,6 +62,12 @@ class LLMRuntimeTests(unittest.TestCase):
         with self.assertRaises(StructuredOutputError):
             validate_model_output(json.dumps(invalid), [policy], "mfa", "Regodit")
 
+    def test_answerable_output_rejects_unresolved_missing_information(self):
+        with self.assertRaises(StructuredOutputError):
+            validate_model_output(
+                json.dumps(payload(missing_information=["audit period"])), [EVIDENCE], "mfa", "Regodit"
+            )
+
     def test_real_engine_uses_strict_structured_model_path(self):
         responses = FakeResponses(payload())
         runtime = OpenAIAnalyst(SimpleNamespace(responses=responses), model="test-model")
@@ -81,6 +88,22 @@ class LLMRuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "VERIFIED")
         self.assertNotEqual(result.answer, payload()["answer"])
 
+    def test_model_omission_cannot_erase_deterministic_conflict(self):
+        positive = Evidence("ev-positive", "policy.docx", "data/policy.docx", "policy", "POLICY_REQUIREMENT", "Regodit", "p1", "MFA is required for all core systems.")
+        negative_evidence = Evidence("ev-negative", "confirmation", "profile://negative", "other", "USER_CONFIRMATION", "Regodit", "confirmation", "One active account may not have MFA enabled.")
+        negative = SecurityClaim("c-negative", "mfa", "implemented", "organization-wide/unspecified", False, "Regodit", "USER_CONFIRMED", "USER_CONFIRMATION", ("ev-negative",), negative_evidence.text, 0.85)
+
+        class Profile:
+            def lookup(self, *_):
+                return ProfileEvidence((negative,), (negative_evidence,))
+
+        empty = payload(answerable=False, answer=None, status="UNKNOWN", claims=[], evidence_ids=[], missing_information=["implementation"], follow_up_question="Is MFA currently implemented?")
+        runtime = OpenAIAnalyst(SimpleNamespace(responses=FakeResponses(empty)), model="test-model")
+        item = QuestionnaireItem("Q-1", "1", "Access", "Is MFA required?", "mfa", "test.xlsx", "Sheet1", 1, "B1")
+        result = AnalystEngine(profile=Profile(), retriever=lambda *args: [positive], model_runtime=runtime).investigate(item)
+        self.assertEqual(result.status, "CONFLICT")
+        self.assertTrue(result.conflicts)
+
     def test_prism_trajectory_preserves_session_and_pipeline(self):
         class FakePrism:
             def __init__(self):
@@ -88,6 +111,7 @@ class LLMRuntimeTests(unittest.TestCase):
 
             def submit_trajectory(self, steps, **kwargs):
                 self.trajectories.append((steps, kwargs))
+                return {"id": "trajectory-1"}
 
         observer = PrismObserver("conversation-123")
         observer._client = FakePrism()
@@ -100,6 +124,8 @@ class LLMRuntimeTests(unittest.TestCase):
         self.assertEqual(details["conversation_id"], "conversation-123")
         self.assertEqual([step["step_type"] for step in steps], ["tool_call", "reasoning", "final_answer"])
         self.assertEqual(details["agent_name"], "regodit-security-analyst")
+        self.assertFalse(details["async_send"])
+        self.assertEqual(observer.trajectory_ids, ["trajectory-1"])
 
 
 if __name__ == "__main__":

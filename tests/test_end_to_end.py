@@ -16,6 +16,7 @@ class EndToEndTests(unittest.TestCase):
         self.service = AppService(root / "profile.sqlite3", root / "exports")
 
     def tearDown(self):
+        self.service.close()
         self.temp.cleanup()
 
     def test_fully_verified_control_has_policy_and_assessment_chain(self):
