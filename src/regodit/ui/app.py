@@ -420,150 +420,6 @@ class AppService:
         self.export()
         return self.dashboard()
 
-    # ------------------------------------------------------------------
-    # Voice channel (ElevenLabs ConvAI server tool)
-    # ------------------------------------------------------------------
-    # A voice agent produces free text, not a question ID. We match the spoken
-    # question to the closest questionnaire item and run the SAME investigation
-    # the web UI runs, so spoken answers carry the same evidence guarantee.
-    # If nothing matches well enough we say so rather than let the voice model
-    # improvise - the golden rule applies on every channel.
-    VOICE_STOPWORDS = frozenset({
-        "does", "your", "organization", "organisation", "have", "the", "and", "you",
-        "for", "are", "any", "with", "that", "this", "from", "what", "how", "who",
-        "when", "where", "please", "provide", "describe", "list", "yes", "out",
-        "there", "been", "will", "our", "its", "can", "than", "each", "such", "use",
-        "performed", "perform", "process", "often", "conduct", "conducted", "place",
-        "used", "level", "based", "within", "other", "must", "need", "ensure",
-        "include", "including", "relevant", "appropriate", "least", "regarding",
-        "organizations", "following", "provided", "available",
-    })
-    VOICE_ALIASES = {
-        "mfa": "mfa", "2fa": "mfa", "multifactor": "mfa", "multi": "mfa",
-        "factor": "mfa", "twofactor": "mfa", "otp": "mfa",
-        "authenticate": "authentication", "authenticator": "authentication",
-        "encrypt": "encryption", "encrypted": "encryption", "cryptography": "encryption",
-        "backup": "backup", "backed": "backup", "restore": "backup", "recovery": "backup",
-        "pentest": "penetration", "pentesting": "penetration",
-        "vuln": "vulnerability", "vulnerabilities": "vulnerability", "scanning": "vulnerability",
-        "offboard": "termination", "offboarding": "termination", "terminate": "termination",
-        "onboard": "onboarding", "leaver": "termination",
-        "prod": "production", "breach": "incident", "incidents": "incident",
-        "vendor": "thirdparty", "supplier": "thirdparty", "subprocessor": "thirdparty",
-        "background": "screening", "screen": "screening",
-        "policies": "policy", "controls": "control", "employees": "employee",
-        "staff": "employee", "personnel": "employee", "everyone": "employee",
-    }
-    VOICE_MIN_SCORE = 0.30
-    VOICE_MIN_OVERLAP = 2
-    VOICE_SOLO_SCORE = 0.60
-
-    @classmethod
-    def _stem(cls, word: str) -> str:
-        word = word.replace("-", "")
-        word = cls.VOICE_ALIASES.get(word, word)
-        for suffix in ("ations", "ation", "ing", "ies", "ed", "es", "s"):
-            if len(word) > 5 and word.endswith(suffix):
-                base = word[: -len(suffix)]
-                if suffix == "ies":
-                    base += "y"
-                return cls.VOICE_ALIASES.get(base, base)
-        return word
-
-    @classmethod
-    def _voice_tokens(cls, text: str) -> set[str]:
-        words = re.findall(r"[A-Za-z][A-Za-z0-9-]{1,}", text.casefold())
-        return {cls._stem(w) for w in words
-                if w not in cls.VOICE_STOPWORDS and len(w) > 2}
-
-    def match_question(self, spoken: str) -> tuple[QuestionnaireItem | None, float]:
-        asked = self._voice_tokens(spoken)
-        if not asked:
-            return None, 0.0
-        best, best_score = None, 0.0
-        for item in self.items:
-            target = self._voice_tokens(f"{item.category} {item.question}")
-            if not target:
-                continue
-            overlap = asked & target
-            if not overlap:
-                continue
-            score = (len(overlap) / len(asked)) * 0.7 + (len(overlap) / len(target)) * 0.3
-            if len(overlap) < self.VOICE_MIN_OVERLAP and score < self.VOICE_SOLO_SCORE:
-                continue
-            if score > best_score:
-                best, best_score = item, score
-        if best is None or best_score < self.VOICE_MIN_SCORE:
-            return None, round(best_score, 3)
-        return best, round(best_score, 3)
-
-    def voice_ask(self, spoken: str, stakeholder: str | None = None) -> dict[str, Any]:
-        spoken = (spoken or "").strip()
-        if not spoken:
-            raise ValueError("question is required")
-        item, score = self.match_question(spoken)
-        if item is None:
-            return {
-                "spoken_answer": "That is not something the questionnaire covers, and I could "
-                                 "not find it in the company evidence. Could you rephrase it, or "
-                                 "tell me the answer and I will record it?",
-                "status": "UNKNOWN", "matched_question": None, "question_id": None,
-                "match_score": score, "confidence": 0.0, "sources": [], "follow_up": None,
-            }
-        result = self.investigate(item.id)
-        sources = [self.evidence_by_id[e].source_path for e in result.evidence_ids
-                   if e in self.evidence_by_id]
-        unique_sources = list(dict.fromkeys(sources))
-        if result.status == "CONFLICT" or result.next_action == "RESOLVE_CONFLICT":
-            detail = result.conflicts[0].description if result.conflicts else ""
-            spoken_answer = (f"The company records disagree on this. {detail} "
-                             f"{result.follow_up_question or ''}").strip()
-        elif result.next_action == "ASK_FOLLOW_UP":
-            spoken_answer = (f"The documents do not go far enough. "
-                             f"{result.follow_up_question}").strip()
-        elif result.answer:
-            body = result.answer.rstrip(" .")
-            if unique_sources:
-                spoken_answer = f"{body}, according to {PurePosixPath(unique_sources[0]).name}."
-            else:
-                spoken_answer = f"{body}."
-        else:
-            spoken_answer = ("I could not verify that in the company evidence, so I am "
-                             "marking it unknown rather than guessing.")
-        return {
-            "spoken_answer": spoken_answer,
-            "status": result.status,
-            "question_id": result.question_id,
-            "matched_question": item.question,
-            "match_score": score,
-            "confidence": result.confidence,
-            "sources": unique_sources[:4],
-            "follow_up": result.follow_up_question,
-        }
-
-    def voice_record(self, question_id: str, response: str, stakeholder: str | None = None) -> dict[str, Any]:
-        result = self.submit_follow_up(question_id, response, stakeholder)
-        # A spoken confirmation is the same durable fact as a typed one, so it must fan out
-        # through the central synchronizer. Without this the voice channel would update one
-        # row while chat updated every row mapped to the control - exactly the drift the
-        # questionnaire synchronization phase exists to prevent.
-        affected: list[str] = []
-        if result.status in {"USER_CONFIRMED", "VERIFIED"} and hasattr(self, "synchronizer"):
-            control = normalize_control(self._item(question_id).normalized_control)
-            changes = self.synchronizer.synchronize_control(control, "voice confirmation")
-            affected = [change.question_id for change in changes]
-        spoken = ("Recorded. I will not ask that again."
-                  if result.status in {"USER_CONFIRMED", "VERIFIED"}
-                  else f"I still need something more specific. {result.follow_up_question or ''}".strip())
-        if len(affected) > 1:
-            spoken = f"Recorded. That also answered {len(affected) - 1} related question"                      f"{'s' if len(affected) > 2 else ''}. I will not ask those again."
-        return {
-            "spoken_answer": spoken,
-            "status": result.status,
-            "question_id": result.question_id,
-            "affected_questions": affected,
-        }
-
     def submit_follow_up(self, question_id: str, response: str, stakeholder: str | None) -> InvestigationResult:
         item = self._item(question_id)
         try:
@@ -704,7 +560,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
-        self._cors()
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -755,16 +610,6 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
-    def _cors(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "content-type, authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-
-    def do_OPTIONS(self) -> None:  # noqa: N802
-        self.send_response(HTTPStatus.NO_CONTENT)
-        self._cors()
-        self.end_headers()
-
     def do_POST(self) -> None:  # noqa: N802
         try:
             body = self._body()
@@ -782,10 +627,6 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.service.retest(body.get("scope", "unresolved"), body.get("question_ids"))
             elif self.path == "/api/export":
                 payload = self.service.export()
-            elif self.path == "/api/voice-ask":
-                payload = self.service.voice_ask(body.get("question", ""), body.get("stakeholder"))
-            elif self.path == "/api/voice-record":
-                payload = self.service.voice_record(body["question_id"], body["response"], body.get("stakeholder"))
             else:
                 self._json({"error": "not found"}, 404)
                 return
@@ -855,10 +696,10 @@ function showError(e){document.getElementById('result').innerHTML=`<div class="p
 
 INDEX_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Regodit AI Security Analyst</title><style>
-:root{--bg:#f6f7fb;--side:#101827;--card:#fff;--line:#e4e7ec;--text:#182230;--muted:#667085;--brand:#4255d4;--green:#087443;--amber:#a15c00;--red:#b42318}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px Inter,system-ui,sans-serif}.app{display:grid;grid-template-columns:235px 1fr;height:100vh}.side{background:var(--side);color:#fff;padding:22px 16px;display:flex;flex-direction:column;gap:8px}.logo{font-size:21px;font-weight:800;padding:4px 8px 20px}.side button{background:transparent;color:#d5d9e3;border:0;text-align:left;padding:11px;border-radius:8px;cursor:pointer;font:inherit}.side button:hover,.side button.active{background:#273449;color:white}.progress{margin-top:auto;background:#1d2939;border-radius:10px;padding:13px;color:#d0d5dd}.progress b{display:block;color:#fff;font-size:18px;margin-bottom:5px}.main{min-width:0;height:100vh}.view{display:none;height:100%}.view.active{display:flex}.chat{flex-direction:column;max-width:930px;margin:auto;background:white;border-left:1px solid var(--line);border-right:1px solid var(--line)}.top{padding:18px 24px;border-bottom:1px solid var(--line);font-weight:750}.messages{flex:1;overflow:auto;padding:28px 9%;display:flex;flex-direction:column;gap:22px}.msg{max-width:82%;line-height:1.55}.msg.user{align-self:flex-end;background:#eef0ff;padding:12px 15px;border-radius:15px}.msg.assistant{align-self:flex-start}.status{font-size:12px;font-weight:800;margin-bottom:5px}.VERIFIED{color:var(--green)}.USER_CONFIRMED{color:#6941c6}.UNKNOWN{color:var(--amber)}.CONFLICT{color:var(--red)}details{margin-top:9px;border:1px solid var(--line);border-radius:9px;padding:9px;background:#fafafa}.source{padding:8px 0;border-top:1px solid var(--line)}.source small{color:var(--muted)}.composer{border-top:1px solid var(--line);padding:14px 7% 20px}.suggestions{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:10px}.suggestions button,.ask,.generate{border:1px solid var(--line);background:white;border-radius:20px;padding:8px 12px;cursor:pointer}.input{display:flex;gap:9px}.input textarea{resize:none;min-height:50px;max-height:120px;flex:1;border:1px solid #cfd4dc;border-radius:14px;padding:14px;font:inherit}.send{background:var(--brand);color:#fff;border:0;border-radius:13px;padding:0 22px;font-weight:700;cursor:pointer}.workspace{padding:28px;overflow:auto;width:100%}.workspace h1{margin-top:0}.toolbar{display:flex;justify-content:space-between;align-items:center}.generate{background:var(--brand);color:#fff;border-color:var(--brand);border-radius:8px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}a.ask{text-decoration:none;color:var(--text);display:inline-block;white-space:nowrap}a.ask:hover{background:#f2f4f7}.table{background:#fff;border:1px solid var(--line);border-radius:12px;overflow:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:12px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted)}.pill{font-weight:800;font-size:11px}.muted{color:var(--muted)}.modelbar{margin-top:10px;background:#1d2939;border-radius:10px;padding:11px;color:#98a2b3;font-size:12px;line-height:1.5}.modelbar b{display:block;color:#fff;font-size:13px}.retest,.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px;margin:16px 0}.scopes{display:flex;flex-direction:column;gap:7px;margin:8px 0 12px}.scopes label{font-weight:400;cursor:pointer}#retestQuestion,#historyQuestion{max-width:100%;padding:9px;border:1px solid var(--line);border-radius:8px;margin-bottom:12px}.stat{display:inline-block;margin:0 18px 8px 0}.stat b{display:block;font-size:20px}.flag{color:var(--red);font-weight:700}.timeline{border-left:2px solid var(--line);padding-left:14px;margin-top:8px}.timeline div{padding:6px 0}@media(max-width:720px){.app{grid-template-columns:76px 1fr}.side button{font-size:0}.side button:first-letter{font-size:16px}.logo{font-size:0}.logo:first-letter{font-size:22px}.progress{display:none}.messages{padding:20px}}
+:root{--bg:#f6f7fb;--side:#101827;--card:#fff;--line:#e4e7ec;--text:#182230;--muted:#667085;--brand:#4255d4;--green:#087443;--amber:#a15c00;--red:#b42318}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px Inter,system-ui,sans-serif}.app{display:grid;grid-template-columns:235px 1fr;height:100vh}.side{background:var(--side);color:#fff;padding:22px 16px;display:flex;flex-direction:column;gap:8px}.logo{font-size:21px;font-weight:800;padding:4px 8px 20px}.side button{background:transparent;color:#d5d9e3;border:0;text-align:left;padding:11px;border-radius:8px;cursor:pointer;font:inherit}.side button:hover,.side button.active{background:#273449;color:white}.progress{margin-top:auto;background:#1d2939;border-radius:10px;padding:13px;color:#d0d5dd}.progress b{display:block;color:#fff;font-size:18px;margin-bottom:5px}.main{min-width:0;height:100vh}.view{display:none;height:100%}.view.active{display:flex}.chat{flex-direction:column;max-width:930px;margin:auto;background:white;border-left:1px solid var(--line);border-right:1px solid var(--line)}.top{padding:18px 24px;border-bottom:1px solid var(--line);font-weight:750}.messages{flex:1;overflow:auto;padding:28px 9%;display:flex;flex-direction:column;gap:22px}.msg{max-width:82%;line-height:1.55}.msg.user{align-self:flex-end;background:#eef0ff;padding:12px 15px;border-radius:15px}.msg.assistant{align-self:flex-start}.status{font-size:12px;font-weight:800;margin-bottom:5px}.VERIFIED{color:var(--green)}.USER_CONFIRMED{color:#6941c6}.UNKNOWN{color:var(--amber)}.CONFLICT{color:var(--red)}details{margin-top:9px;border:1px solid var(--line);border-radius:9px;padding:9px;background:#fafafa}.source{padding:8px 0;border-top:1px solid var(--line)}.source small{color:var(--muted)}.composer{border-top:1px solid var(--line);padding:14px 7% 20px}.suggestions{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:10px}.suggestions button,.ask,.generate{border:1px solid var(--line);background:white;border-radius:20px;padding:8px 12px;cursor:pointer}.input{display:flex;gap:9px}.input textarea{resize:none;min-height:50px;max-height:120px;flex:1;border:1px solid #cfd4dc;border-radius:14px;padding:14px;font:inherit}.send{background:var(--brand);color:#fff;border:0;border-radius:13px;padding:0 22px;font-weight:700;cursor:pointer}.workspace{padding:28px;overflow:auto;width:100%}.workspace h1{margin-top:0}.toolbar{display:flex;justify-content:space-between;align-items:center}.generate{background:var(--brand);color:#fff;border-color:var(--brand);border-radius:8px}.table{background:#fff;border:1px solid var(--line);border-radius:12px;overflow:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:12px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted)}.pill{font-weight:800;font-size:11px}.muted{color:var(--muted)}.modelbar{margin-top:10px;background:#1d2939;border-radius:10px;padding:11px;color:#98a2b3;font-size:12px;line-height:1.5}.modelbar b{display:block;color:#fff;font-size:13px}.retest,.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px;margin:16px 0}.scopes{display:flex;flex-direction:column;gap:7px;margin:8px 0 12px}.scopes label{font-weight:400;cursor:pointer}#retestQuestion,#historyQuestion{max-width:100%;padding:9px;border:1px solid var(--line);border-radius:8px;margin-bottom:12px}.stat{display:inline-block;margin:0 18px 8px 0}.stat b{display:block;font-size:20px}.flag{color:var(--red);font-weight:700}.timeline{border-left:2px solid var(--line);padding-left:14px;margin-top:8px}.timeline div{padding:6px 0}@media(max-width:720px){.app{grid-template-columns:76px 1fr}.side button{font-size:0}.side button:first-letter{font-size:16px}.logo{font-size:0}.logo:first-letter{font-size:22px}.progress{display:none}.messages{padding:20px}}
 </style></head><body><div class="app"><aside class="side"><div class="logo">Regodit</div><button class="nav active" data-view="chat">💬 Conversation</button><button class="nav" data-view="questionnaire">▦ Questionnaire</button><button class="nav" data-view="profile">◉ Security Profile</button><button class="nav" data-view="conflicts">⚠ Conflicts</button><button class="nav" data-view="evidence">⌕ Evidence</button><button class="nav" data-view="model">⟳ Model &amp; Retest</button><div class="progress" id="progress"></div><div class="modelbar" id="modelbar"></div></aside><main class="main">
 <section id="chat" class="view chat active"><div class="top">Regodit <span class="muted">· AI Security Analyst</span></div><div class="messages" id="messages"></div><div class="composer"><div class="suggestions" id="suggestions"></div><div class="input"><textarea id="input" placeholder="Ask Regodit or answer the pending question…"></textarea><button class="send" onclick="send()">Send</button></div></div></section>
-<section id="questionnaire" class="view workspace"><div><div class="toolbar"><div><h1>Questionnaire</h1><p class="muted">Evidence-backed status and completion queue.</p></div><div class="actions"><a class="ask" href="/download/json" download>&#8681; Save as JSON</a><a class="ask" href="/download/xlsx" download>&#8681; Save as Excel</a><button class="generate" onclick="sendAction('Generate questionnaire')">Generate Questionnaire</button></div></div><div class="table"><table><thead><tr><th>ID</th><th>Question</th><th>Answer</th><th>Status</th><th>Action</th></tr></thead><tbody id="questions"></tbody></table></div></div></section>
+<section id="questionnaire" class="view workspace"><div><div class="toolbar"><div><h1>Questionnaire</h1><p class="muted">Evidence-backed status and completion queue.</p></div><button class="generate" onclick="sendAction('Generate questionnaire')">Generate Questionnaire</button></div><div class="table"><table><thead><tr><th>ID</th><th>Question</th><th>Answer</th><th>Status</th><th>Action</th></tr></thead><tbody id="questions"></tbody></table></div></div></section>
 <section id="profile" class="view workspace"><div><h1>Security Profile</h1><p class="muted">Durable employee-confirmed facts. Corrections retain audit history.</p><div id="claims"></div></div></section>
 <section id="conflicts" class="view workspace"><div><h1>Conflicts</h1><div id="conflictRows"></div></div></section>
 <section id="evidence" class="view workspace"><div><h1>Evidence</h1><p class="muted">Sources are shown compactly with each verified conversational answer.</p></div></section>
@@ -882,11 +723,7 @@ function questionOptions(){const rows=(dashboard&&dashboard.questions)||[];const
 async function runRetest(){const scope=document.querySelector('input[name=scope]:checked').value;const button=document.getElementById('retestButton');const out=document.getElementById('retestResult');button.disabled=true;out.innerHTML='<p class="muted">Replaying questions against the stored evidence…</p>';try{const body={scope};if(scope==='selected')body.question_ids=[document.getElementById('retestQuestion').value];const r=await api('/api/retest',body);const rows=(r.changes||[]).map(c=>`<tr><td>${c.question_id}</td><td>${esc(c.previous_status)} (${esc(c.previous_model||'—')})</td><td>${esc(c.new_status)} (${esc(c.model)})</td><td>${c.new_evidence_ids.length} source(s)</td><td>${esc(c.note)}</td></tr>`).join('');const flags=(r.suspicious_upgrades||[]).length?`<p class="flag">Flagged — resolved without evidence the previous run had not already seen: ${esc(r.suspicious_upgrades.join(', '))}. A newer result is not better merely because it resolves more questions.</p>`:'';out.innerHTML=`<div class="card"><h3>Retest complete</h3><div class="stat"><b>${r.evaluated}</b>Questions evaluated</div><div class="stat"><b>${r.newly_resolved}</b>Newly resolved</div><div class="stat"><b>${r.still_unknown}</b>Still unknown</div><div class="stat"><b>${r.conflicts_resolved}</b>Conflicts resolved</div><div class="stat"><b>${r.new_conflicts}</b>New conflicts</div><div class="stat"><b>${r.not_applied}</b>Existing state kept</div><p class="muted">Previous model: ${esc((r.previous_models||[]).join(', ')||'—')} · Current model: ${esc(r.model)}</p><p class="muted">Before: ${r.before.resolved} resolved, ${r.before.unknown} unknown, ${r.before.conflict} conflict · After: ${r.after.resolved} resolved, ${r.after.unknown} unknown, ${r.after.conflict} conflict</p>${flags}${rows?`<details open><summary>View changes (${r.changes.length})</summary><table><thead><tr><th>ID</th><th>Previous</th><th>Current</th><th>Evidence</th><th>Reason</th></tr></thead><tbody>${rows}</tbody></table></details>`:'<p class="muted">No questionnaire row changed status.</p>'}</div>`;await loadDashboard()}catch(e){out.innerHTML=`<p class="flag">${esc(e.message)}</p>`}finally{button.disabled=false}}
 async function loadHistory(){const id=document.getElementById('historyQuestion').value;if(!id)return;const out=document.getElementById('historyResult');try{const h=await api('/api/history?question_id='+encodeURIComponent(id));const rows=h.evaluations.map(e=>`<div><b>${esc(e.created_at.slice(0,19).replace('T',' '))}</b> · ${esc(e.status)}${e.accepted?'':' (not applied)'}<br><small class="muted">${esc(e.run_type)} · model ${esc(e.model)} · ${e.evidence_ids.length} source(s)${e.note?' · '+esc(e.note):''}</small></div>`).join('');const cands=h.conflict_candidates.map(c=>`<div class="flag">Model ${esc(c.model)} proposed ${esc(c.proposed_status)} against confirmed ${esc(c.existing_status)} — kept, not applied.</div>`).join('');out.innerHTML=`<div class="card"><h3>${esc(h.question_id)} · current status ${esc(h.current_status)}</h3><div class="timeline">${rows||'<div class="muted">No recorded evaluations yet.</div>'}</div>${cands}</div>`}catch(e){out.innerHTML=`<p class="flag">${esc(e.message)}</p>`}}
 document.getElementById('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});Promise.all([api('/api/chat?thread_id='+encodeURIComponent(thread)).then(renderChat),loadDashboard()]);
-</script>
-<style>elevenlabs-convai{position:fixed;right:16px;bottom:16px;z-index:60}.composer{padding-bottom:150px}.workspace{padding-bottom:160px}@media(max-width:720px){.composer{padding-bottom:140px}}</style>
-<elevenlabs-convai agent-id="agent_1601m1s5w1r1e2zvq2zzp5ez0w26"></elevenlabs-convai>
-<script src="https://unpkg.com/@elevenlabs/convai-widget-embed" async type="text/javascript"></script>
-</body></html>'''
+</script></body></html>'''
 
 
 if __name__ == "__main__":
