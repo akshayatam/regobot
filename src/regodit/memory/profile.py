@@ -340,6 +340,22 @@ class SecurityProfile:
             tuple(json.loads(row["evidence_ids_json"])), tuple(json.loads(row["missing_information_json"])), row["updated_at"],
         )
 
+    def save_confirmed_questionnaire_state(
+        self, question_id: str, answer: str, evidence_ids: Iterable[str], missing_information: Iterable[str] = ()
+    ) -> None:
+        """Persist a user-confirmed row assembled from validated conversational facts."""
+        identifiers = tuple(dict.fromkeys(evidence_ids))
+        if not answer.strip() or not identifiers:
+            raise ValueError("confirmed questionnaire state requires an answer and evidence")
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO questionnaire_state VALUES (?, ?, 'USER_CONFIRMED', 0.85, ?, ?, ?)
+                   ON CONFLICT(question_id) DO UPDATE SET answer=excluded.answer, status='USER_CONFIRMED',
+                   confidence=excluded.confidence, evidence_ids_json=excluded.evidence_ids_json,
+                   missing_information_json=excluded.missing_information_json, updated_at=excluded.updated_at""",
+                (question_id, answer, json.dumps(identifiers), json.dumps(tuple(missing_information)), _now()),
+            )
+
     def needs_question(self, question_id: str) -> bool:
         state = self.questionnaire_state(question_id)
         return state is None or state.status in {"UNKNOWN", "CONFLICT"}

@@ -159,6 +159,8 @@ def validate_model_output(raw: str, evidence: list[Evidence], expected_control: 
         raise StructuredOutputError("top-level evidence IDs must be cited by validated claims")
     if payload["answerable"] and (not answer or payload["status"] not in {"VERIFIED", "USER_CONFIRMED"} or not claims):
         raise StructuredOutputError("answerable results require an answer, supported claims, and resolved status")
+    if payload["answerable"] and (payload["conflicts"] or payload["missing_information"] or follow_up):
+        raise StructuredOutputError("answerable results cannot contain conflicts, missing information, or a follow-up")
     if not payload["answerable"] and answer is not None:
         raise StructuredOutputError("unanswerable results cannot contain an answer")
     if payload["status"] == "CONFLICT" and not payload["conflicts"]:
@@ -177,6 +179,7 @@ class OpenAIAnalyst:
     def __init__(self, client: Any | None = None, model: str = LLM_MODEL):
         self.model = model
         self._client = client
+        self.last_attempt: dict[str, Any] | None = None
         if self._client is None and self.enabled:
             try:
                 from openai import OpenAI
@@ -190,9 +193,13 @@ class OpenAIAnalyst:
     def enabled(self) -> bool:
         return (LLM_PROVIDER == "openai" and bool(OPENAI_API_KEY)) or self._client is not None
 
-    def analyze(self, *, question: str, question_id: str, control: str, organization: str, evidence: list[Evidence]) -> LLMRun:
+    def analyze(
+        self, *, question: str, question_id: str, control: str, organization: str,
+        evidence: list[Evidence], answer_kind: str | None = None, required_strength: str | None = None,
+    ) -> LLMRun:
         if not self.enabled or self._client is None:
             raise RuntimeError("OpenAI reasoning is not configured")
+        self.last_attempt = None
         compact_evidence = [
             {
                 "id": item.id, "source_name": item.source_name, "source_category": item.source_category,
@@ -203,6 +210,16 @@ class OpenAIAnalyst:
         ]
         user_payload = json.dumps({
             "question_id": question_id, "question": question, "normalized_control": control,
+            "answer_kind": answer_kind, "required_strength": required_strength,
+            "output_rules": [
+                f"Use the exact control string {control!r} on every claim.",
+                "Return at most three claims: only the strongest claims necessary to answer this exact question.",
+                "For boolean questions use attribute 'required' for DOCUMENTED requirements and 'implemented' for implementation evidence.",
+                "For frequency/location/list answers use attribute 'cadence'/'location'/'authorized_personnel' respectively.",
+                "If answerable is true, missing_information and conflicts must be empty and follow_up_question must be null.",
+                "When no validated claim supports an evidence item, do not include that item's ID in top-level evidence_ids.",
+                "Keep the final answer to two sentences or fewer.",
+            ],
             "organization": organization, "evidence": compact_evidence,
         }, ensure_ascii=False)
         messages = (
@@ -214,12 +231,19 @@ class OpenAIAnalyst:
             model=self.model,
             input=list(messages),
             text={"format": {"type": "json_schema", "name": "regodit_investigation", "strict": True, "schema": OUTPUT_SCHEMA}},
+            reasoning={"effort": "low"},
+            max_output_tokens=3000,
         )
         latency_ms = round((time.perf_counter() - started) * 1000)
         raw = response.output_text
-        analysis = validate_model_output(raw, evidence, control, organization)
         usage = getattr(response, "usage", None)
+        self.last_attempt = {
+            "messages": messages, "raw_output": raw, "latency_ms": latency_ms,
+            "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+            "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+        }
+        analysis = validate_model_output(raw, evidence, control, organization)
         return LLMRun(
             analysis, self.model, messages, raw, latency_ms,
-            int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0),
+            self.last_attempt["input_tokens"], self.last_attempt["output_tokens"],
         )

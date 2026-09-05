@@ -14,11 +14,17 @@ def _default_project_root() -> Path:
     return Path.cwd()
 
 
-PROJECT_ROOT = Path(os.environ.get("REGODIT_PROJECT_ROOT", _default_project_root())).resolve()
-DATA_DIR = Path(os.environ.get("REGODIT_DATA_DIR", PROJECT_ROOT / "data")).resolve()
-ARTIFACT_DIR = Path(os.environ.get("REGODIT_ARTIFACT_DIR", PROJECT_ROOT / "artifacts")).resolve()
-EVIDENCE_PATH = Path(os.environ.get("REGODIT_EVIDENCE_PATH", ARTIFACT_DIR / "evidence.jsonl")).resolve()
-PROFILE_DB = Path(os.environ.get("REGODIT_PROFILE_DB", ARTIFACT_DIR / "security_profile.sqlite3")).resolve()
+def _path_setting(name: str, default: Path) -> Path:
+    value = os.environ.get(name, "").strip()
+    return Path(value).resolve() if value else default.resolve()
+
+
+PROJECT_ROOT = _path_setting("REGODIT_PROJECT_ROOT", _default_project_root())
+DATA_DIR = _path_setting("REGODIT_DATA_DIR", PROJECT_ROOT / "data")
+ARTIFACT_DIR = _path_setting("REGODIT_ARTIFACT_DIR", PROJECT_ROOT / "artifacts")
+EVIDENCE_PATH = _path_setting("REGODIT_EVIDENCE_PATH", ARTIFACT_DIR / "evidence.jsonl")
+PROFILE_DB = _path_setting("REGODIT_PROFILE_DB", ARTIFACT_DIR / "security_profile.sqlite3")
+CONVERSATION_DB = _path_setting("REGODIT_CONVERSATION_DB", ARTIFACT_DIR / "conversations.sqlite3")
 HOST = os.environ.get("REGODIT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("REGODIT_PORT", "8501"))
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai").strip().casefold()

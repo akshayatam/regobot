@@ -235,12 +235,15 @@ class AnalystEngine:
         evidence_by_id = {evidence.id: evidence for evidence in all_evidence}
         request_id = str(uuid.uuid4())
         model_run: LLMRun | None = None
+        model_attempt: dict[str, Any] | None = None
         if self.model_runtime.enabled and intent.answer_kind != "unknown":
             try:
                 model_run = self.model_runtime.analyze(
                     question=item.question, question_id=item.id, control=intent.control,
                     organization=organization, evidence=all_evidence,
+                    answer_kind=intent.answer_kind, required_strength=intent.required_strength,
                 )
+                model_attempt = self.model_runtime.last_attempt
                 self.observer.model_call(
                     request_id=request_id, model=model_run.model, messages=list(model_run.messages),
                     output=model_run.raw_output, latency_ms=model_run.latency_ms,
@@ -253,12 +256,32 @@ class AnalystEngine:
                 )
             except Exception as exc:
                 # Model/network/schema failures must not bypass evidence checks or crash the application.
-                LOGGER.warning("Grounded model analysis failed for %s; using deterministic fallback: %s", item.id, type(exc).__name__)
+                LOGGER.warning("Grounded model analysis failed for %s; using deterministic fallback: %s: %s", item.id, type(exc).__name__, exc)
+                attempt = self.model_runtime.last_attempt
+                model_attempt = attempt
+                if attempt:
+                    self.observer.model_call(
+                        request_id=request_id, model=self.model_runtime.model, messages=list(attempt["messages"]),
+                        output=attempt["raw_output"], latency_ms=attempt["latency_ms"],
+                        input_tokens=attempt["input_tokens"], output_tokens=attempt["output_tokens"],
+                        metadata={
+                            "question_id": item.id, "normalized_control": intent.control,
+                            "retrieved_evidence_count": len(all_evidence), "structured_output_valid": False,
+                            "validation_error_type": type(exc).__name__,
+                        },
+                    )
                 model_run = None
-        if model_run:
-            extracted_claims = model_run.analysis.claims
-        else:
-            extracted_claims = extract_claims(retrieved, intent.control).claims
+        # The model may enrich interpretation, but it may not erase conservative evidence claims
+        # and thereby hide a contradiction. Merge both validated sources by stable claim content.
+        deterministic_claims = list(extract_claims(retrieved, intent.control).claims)
+        model_claims = list(model_run.analysis.claims) if model_run else []
+        extracted_claims = []
+        seen_claims: set[tuple[Any, ...]] = set()
+        for claim in deterministic_claims + model_claims:
+            key = (claim.control, claim.attribute, claim.scope, claim.value, claim.evidence_ids, claim.support_text)
+            if key not in seen_claims:
+                seen_claims.add(key)
+                extracted_claims.append(claim)
         claims = list(profile_result.claims) + list(extracted_claims)
         # Every claim, including injected profile claims, must remain backed by evidence available to this investigation.
         valid_claims: list[SecurityClaim] = []
@@ -306,10 +329,10 @@ class AnalystEngine:
                         item.id, False, None, "UNKNOWN", "MARK_UNKNOWN", tuple(valid_claims), cited, (),
                         model_missing or intent.missing_fields, None, 0.0, True, True,
                     )
-        if model_run:
+        if model_attempt:
             self.observer.investigation(
-                request_id=request_id, question_id=item.id, control=intent.control, model=model_run.model,
-                retrieval_ms=retrieval_ms, model_ms=model_run.latency_ms, evidence_count=len(all_evidence),
+                request_id=request_id, question_id=item.id, control=intent.control, model=self.model_runtime.model,
+                retrieval_ms=retrieval_ms, model_ms=model_attempt["latency_ms"], evidence_count=len(all_evidence),
                 status=result.status, conflict=bool(result.conflicts), follow_up=bool(result.follow_up_question),
             )
         return result

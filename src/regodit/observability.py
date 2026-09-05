@@ -25,6 +25,7 @@ class PrismObserver:
 
     def __post_init__(self) -> None:
         self._client: Any | None = None
+        self.trajectory_ids: list[str] = []
         if not all((PRISMTRACE_API_KEY, PRISMTRACE_PROJECT_ID, PRISMTRACE_HOST)):
             LOGGER.info("PRISM tracing disabled: configure API key, project ID, and host")
             return
@@ -116,15 +117,17 @@ class PrismObserver:
             },
         ]
         try:
-            self._client.submit_trajectory(
+            receipt = self._client.submit_trajectory(
                 steps,
                 agent_name=PRISMTRACE_AGENT_NAME,
                 agent_id=AGENT_ID,
                 conversation_id=self.session_id,
                 request_id=request_id,
                 model=model,
-                async_send=True,
+                async_send=False,
             )
+            if isinstance(receipt, dict) and receipt.get("id"):
+                self.trajectory_ids.append(str(receipt["id"]))
         except Exception as exc:
             LOGGER.warning("PRISM investigation trajectory was skipped: %s", type(exc).__name__)
 
@@ -135,3 +138,17 @@ class PrismObserver:
             self._client.flush(timeout=10.0)
         except Exception as exc:
             LOGGER.warning("PRISM flush failed: %s", type(exc).__name__)
+
+    def evaluations(self) -> list[dict[str, Any]]:
+        """Fetch evaluations for receipt-backed trajectories when available."""
+        if not self._client:
+            return []
+        results: list[dict[str, Any]] = []
+        for trajectory_id in self.trajectory_ids:
+            try:
+                value = self._client.get_trajectory_evaluation(trajectory_id)
+                if isinstance(value, dict):
+                    results.append({"trajectory_id": trajectory_id, "evaluation": value})
+            except Exception as exc:
+                LOGGER.warning("PRISM evaluation fetch failed: %s", type(exc).__name__)
+        return results

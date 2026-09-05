@@ -39,6 +39,8 @@ def run_traced_evaluation(path: Path, force: bool = False) -> dict[str, object]:
     service.engine.flush_traces()
     return {
         "session_id": session_id,
+        "prism_trajectory_ids": list(service.engine.observer.trajectory_ids),
+        "prism_evaluations": service.engine.observer.evaluations(),
         "verified": {"status": verified.status, "question_id": verified.question_id},
         "missing": {"status": missing.status, "follow_up": missing.follow_up_question},
         "conflict": {"status": conflict.status, "follow_up": conflict.follow_up_question},
